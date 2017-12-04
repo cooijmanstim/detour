@@ -2,6 +2,8 @@
 import argparse, datetime, json, logging, os, shutil, signal, sys, tempfile, time
 import subprocess as sp
 
+DETOURS = ".detours"
+
 run_locally = False
 
 logger = logging.Logger("detour")
@@ -48,33 +50,23 @@ class Launch(Main):
 
     # ask for experiment notes if flag
 
-    # using absolute path avoids a lot of weirdness
     invocation = args.invocation
-    invocation[0] = os.path.realpath(invocation[0])
 
-    # file dependencies are considered to be everything in the same directory as main binary
-    # FIXME hmmmppff what if the main binary is python? :-(
-    tree_path = os.path.dirname(invocation[0])
+    # file dependencies are considered to be everything in the current directory
     timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
     assert logger.isEnabledFor(logging.INFO) # still no output -_-
-    logger.warn("tree_path: %s", tree_path)
     logger.warn("invocation: %r", invocation)
     logger.warn("timestamp: %r", timestamp)
 
     stage = tempfile.mkdtemp()
 
     tree_zip_path = os.path.join(stage, "tree.zip")
-    sp.check_call(["zip", "-r", tree_zip_path, tree_path,
+    sp.check_call(["zip", "-r", tree_zip_path, ".",
                    "--exclude", ".git/*",
                    "--exclude", "*/.git/*",
-                   "--exclude", "detours/*",
-                   "--exclude", "*/detours/*"])
-
-    # zip recreates the entire path leading up to the main binary inside the
-    # archive; to invoke it we will want a relative path into the archive's
-    # structure.
-    invocation[0] = invocation[0].lstrip("/")
+                   "--exclude", "%s/*" % DETOURS,
+                   "--exclude", "*/%s/*" % DETOURS])
 
     invocation_path = os.path.join(stage, "invocation.json")
     with open(invocation_path, "w") as invocation_file:
@@ -86,14 +78,16 @@ class Launch(Main):
     # generate a name based on timestamp, invocation and hp/code hash
     # (shortened to 128 bits or 32 hex characters to fit in screen's session name limit)
     treehash = (sp.check_output(["sha256sum", tree_zip_path]).decode()
-                  .splitlines()[0].split()[0])[:32]
+                .splitlines()[0].split()[0])[:32]
     label = "%s_%s" % (timestamp, treehash)
     logger.warn("label: %r", label)
 
-    os.makedirs("detours", exist_ok=True)
-    workdir = os.path.join("detours", label)
+    os.makedirs(DETOURS, exist_ok=True)
+    workdir = os.path.join(DETOURS, label)
     shutil.move(stage, workdir)
-    # TODO: link "latest", although that doesn't work well if we're running multiple in parallel
+    # TODO: how to do "latest" nicely if we're launching a bunch of things?
+    # maybe take a --nickname argument to get a custom latest_<nickname> link
+    sp.check_call(["ln", "-sf", label, "latest"], cwd=DETOURS)
 
     # upload to drive
     # TODO: push in a separate process, then make pull blocking.
@@ -122,7 +116,7 @@ class Launch(Main):
     # or just sync at this point?
     # for live plotting might use google sheets anyway
     pull(label, workdir)
-    sp.check_call("unzip tree.zip", cwd=workdir)
+    sp.check_call("unzip tree.zip".split(), cwd=workdir)
 
 class DealWithScreen(Main):
   @staticmethod
@@ -194,7 +188,6 @@ class Run(Main):
       invocation = json.load(invocation_file)
 
     # TODO: capture stdout/stderr without breaking interactivity
-    # FIXME we are not running the command in the same cwd. forget about this absolute path stuff because it couldn't possibly work
     sp.check_call(invocation, cwd=os.path.join(rundir, "tree"))
 
     # update the tree.zip to reflect changes made by the program
