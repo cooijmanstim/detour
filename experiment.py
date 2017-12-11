@@ -1,4 +1,4 @@
-import os, time
+import datetime, os, time
 from collections import defaultdict as ddict, OrderedDict as ordict, deque
 import numpy as np
 from holster import H
@@ -33,26 +33,25 @@ def updatelike(fn):
   return wrapped_fn
 
 class Experiment(object):
-  # TODO flush regularly and at the end
-  # TODO keep time
-
-# TODO think about how to track time? are we doomed to have one single tracker call every step?
-# what about time in the operation=extend case?
-# idea: have Experiment track walltime and also user-defined (through a tick() method or a context manager?) notions of time
-# how does this help the operation=extend case?
   def __init__(self, label=None):
     self.label = label or os.environ["DETOUR_LABEL"]
     self.trackers = H()
     self.results = set()
-    self.backends = dict()
+    self.backends = H()
+    self.clocks = H()
+    self.clocks.numerical_walltime = NumericalWallClock(self)
+    self.clocks.walltime = WallClock(self)
+
+    # TODO: schedule self.flush?
 
   def __enter__(self):
     return self
 
   def __exit__(self, *args, **kwargs):
-    pass
+    self.flush()
 
   def hp(self, **kwargs):
+    # convenience method to declare a hyperparameter
     (key, value), = kwargs.items()
     if key not in self.trackers:
       self.declare(key, operation="constant", backends="numpy sheets")
@@ -64,21 +63,64 @@ class Experiment(object):
       self.hp({key: value})
 
   def declare(self, key, **kwargs):
+    # declare a quantity to be tracked
     tracker = Tracker(self, key, **kwargs)
     self.trackers[key] = tracker
 
   def register_result(self, path):
+    # take note of an output file, possibly fix up the path e.g. prefix it with a base path
     self.results.add(path)
     return path
 
+  def clock(self, name, reset=True):
+    # get or create a clock, e.g. to count steps
+    if reset or name not in self.clocks:
+      self.clocks[name] = Clock(self)
+    return self.clocks[name]
+
   def get_backend(self, key):
+    # get or create a backend
     if key not in self.backends:
       self.backends[key] = BaseBackend.make(key, self)
     return self.backends[key]
 
-  def flush_backends(self):
-    for backend in self.backends:
+  def flush(self):
+    # flush data to backends
+    for backend in self.backends.Values():
       backend.flush()
+
+class BaseClock(object):
+  def __init__(self, experiment):
+    self.experiment = experiment
+
+class Clock(BaseClock):
+  def __init__(self, experiment):
+    super().__init__(experiment)
+    self.time = 0
+
+  def tick(self):
+    self.time += 1
+
+  def __call__(self):
+    self.tick()
+
+  def __iter__(self):
+    return self
+
+  def __next__(self):
+    self.time += 1
+    return self.time
+
+# special clocks
+class NumericalWallClock(BaseClock):
+  @property
+  def time(self):
+    return time.time()
+
+class WallClock(BaseClock):
+  @property
+  def time(self):
+    return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 class Tracker(object):
   def __init__(self, experiment, key, aggregate=None, operation=None, backends=()):
@@ -100,6 +142,7 @@ class BaseBackend(object):
   def constant(self, x): raise NotImplementedError()
   def replace(self, x): raise NotImplementedError()
   def append(self, x): raise NotImplementedError()
+  # TODO do clock updates between appends due to extend?
   def extend(self, x): raise NotImplementedError()
 
   @staticmethod
@@ -112,31 +155,49 @@ class Numpy(BaseBackend):
   def __init__(self, experiment):
     super().__init__()
     self.experiment = experiment
-    self.data = dict()
+    self.data = H()
+    self.time = ddict(H)
     self.path = self.experiment.register_result("aggregates.npz")
 
   def constant(self, key, value):
     if key in self.data:
-      if value != self.data[value]:
-        raise ValueError("attempt to change constant")
+      if value != self.data[key]:
+        raise ValueError("attempt to change constant %s from %s to %s"
+                         % (key, self.data[value], value))
     else:
       self.data[key] = value
+      for name, clock in self.experiment.clocks.Items():
+        self.time[name][key] = clock.time
 
   def replace(self, key, value):
     self.data[key] = value
+    for name, clock in self.experiment.clocks.Items():
+      self.time[name][key] = clock.time
 
   def append(self, key, value):
     if key not in self.data:
       self.data[key] = []
     self.data[key].append(value)
+    for name, clock in self.experiment.clocks.Items():
+      if key not in self.time[name]:
+        self.time[name][key] = []
+      self.time[name][key].append(clock.time)
 
   def extend(self, key, value):
     if key not in self.data:
       self.data[key] = []
+      self.time[key] = []
+    value = list(value)
     self.data[key].extend(value)
+    for name, clock in self.experiment.clocks.Items():
+      self.time[name][key].extend(len(value) * clock.time)
 
   def flush(self):
-    np.savez_compressed(self.path, **self.data)
+    dikt = dict(self.data.AsDict())
+    dikt.update(("%s__clock_%s" % (key, name), value)
+                for name, things in self.time.items()
+                for key, value in things.Items())
+    np.savez_compressed(self.path, **dikt)
 
 class Sheets(BaseBackend):
   def __init__(self, experiment):
@@ -158,75 +219,154 @@ class Sheets(BaseBackend):
 
     # NOTE: sheet 1 is reserved for meta: hyperparameters (linked from the general aggregates) and
     # detour status.
+    # TODO do this linking
 
     self.worksheets = dict()
-    self.offsets = ddict(lambda: 4) # rows 1, 2, 3 are reserved
+    self.offsets = ddict(lambda: 2) # row 1 is header
+    self.widths = dict() # for vector quantities we require fixed width
 
   def get_worksheet(self, key):
     try:
       return self.worksheets[key]
     except KeyError:
-      self.worksheets[key] = self.sheet.add_worksheet(title=key, rows=1000, cols=10)
+      self.worksheets[key] = Worksheet(self.sheet, key)
       return self.worksheets[key]
 
   def get_offset(self, key):
-    return self.offsets[key], 2
+    return self.offsets[key], 1
+
+  def validate_width(self, key, width):
+    if key not in self.widths:
+      self.widths[key] = width
+      self.install_header(key)
+    elif self.widths[key] != width:
+      # FIXME turn this into a warning; it only mangles the sheet layout
+      raise ValueError("dimensionality of %s changed from %s to %s" % (key, self.widths[key], width))
+
+  def install_header(self, key):
+    data_headers = self.widths[key] * [key]
+    clock_headers = list(self.experiment.clocks.Keys())
+    wks = self.get_worksheet(key)
+    wks.put(1, 1, [data_headers + clock_headers])
+
+  def get_timestamp(self):
+    return [clock.time for clock in self.experiment.clocks.Values()]
 
   def constant(self, key, value):
     if isinstance(value, np.ndarray):
-      assert value.ndim <= 1
+      assert value.ndim <= 2
+
+    # turn into list of lists
+    xs = list(value) if is_sequence(value) else [value]
+    xss = [list(x) if is_sequence(x) else [x] for x in xs]
+
+    for xs in xss:
+      self.validate_width(key, len(xs))
 
     wks = self.get_worksheet(key)
     i, j = self.get_offset(key)
-    xs = list(value) if is_sequence(value) else [value]
-    dim = len(xs)
-    cells = wks.range(i, j, i, j + dim - 1)
-    existing_xs = [cell.value for cell in cells]
-    if any(existing_x != x
-           for existing_x, x in eqzip(existing_xs, xs)
-           if existing_x != ""):
-      raise ValueError("attempt to change constant %s from %s to %s" % (key, existing_xs, xs))
-    for cell, x in zip(cells, xs):
-      cell.value = x
-    wks.update_cells(cells)
+    yss = wks.get(i, j, len(xss), len(xss[0]))
+
+    if all(y == "" for ys in yss for y in ys):
+      ts = self.get_timestamp()
+      wks.put(i, j, [xs + ts for xs in xss])
+    else:
+      if not np.arrays_equal(xss, yss):
+        raise ValueError("attempt to change constant %s from %s to %s"
+                         % (key, yss, xss))
 
   def replace(self, key, value):
     if isinstance(value, np.ndarray):
-      assert value.ndim <= 1
+      assert value.ndim <= 2
 
-    wks = self.get_worksheet(key)
-    i, j = self.get_offset(key)
+    # turn into list of lists
     xs = list(value) if is_sequence(value) else [value]
-    dim = len(xs)
-    cells = wks.range(i, j, i, j + dim - 1)
-    for cell, x in zip(cells, xs):
-      cell.value = x
-    wks.update_cells(cells)
+    xss = [list(x) if is_sequence(x) else [x] for x in xs]
+
+    for xs in xss:
+      self.validate_width(key, len(xs))
+
+    ts = self.get_timestamp()
+    i, j = self.get_offset(key)
+    wks.put(i, j, [xs + ts for xs in xss])
 
   def append(self, key, value):
-    self.replace(key, value)
+    if isinstance(value, np.ndarray):
+      assert value.ndim <= 1
+
+    xs = list(value) if is_sequence(value) else [value]
+    self.validate_width(key, len(xs))
+    ts = self.get_timestamp()
+    wks = self.get_worksheet(key)
+    i, j = self.get_offset(key)
+    wks.put(i, j, [xs + ts])
     self.offsets[key] += 1
 
   def extend(self, key, value):
-    wks = self.get_worksheet(key)
     if isinstance(value, np.ndarray):
       assert value.ndim <= 2
+
     assert is_sequence(value)
-    cells = []
-    for di, xs in enumerate(value):
-      i, j = self.get_offset(key)
-      xs = list(xs) if is_sequence(xs) else [xs]
-      dim = len(xs)
-      row = wks.range(i + di, j, i + di, j + dim - 1)
-      for cell, x in zip(row, xs):
-        cell.value = x
-      cells.extend(row)
-      self.offsets[key] += 1
-    wks.update_cells(cells)
+    ts = self.get_timestamp()
+    xss = list(map(list, xss))
+    for xs in xss:
+      self.validate_width(key, len(xs))
+    wks = self.get_worksheet(key)
+    i, j = self.get_offset(key)
+    wks.put(i, j, [xs + ts for xs in xss])
+    self.offsets[key] += len(xss)
 
   def flush(self):
-    pass
+    for key, worksheet in self.worksheets.items():
+      worksheet.flush()
 
+
+class Worksheet(object):
+  def __init__(self, sheet, key):
+    self.sheet = sheet
+    self.key = key
+    self.num_rows = 1
+    self.num_cols = 1
+    self.worksheet = self.sheet.add_worksheet(
+      title=self.key, rows=self.num_rows, cols=self.num_cols)
+    self.backlog = []
+
+  def range(self, top, left, bottom, right):
+    grow = False
+    while bottom > self.num_rows:
+      self.num_rows *= 2
+      grow = True
+    while right > self.num_cols:
+      self.num_cols *= 2
+      grow = True
+    if grow:
+      self.worksheet.resize(rows=self.num_rows, cols=self.num_cols)
+    cs = self.worksheet.range(top, left, bottom, right)
+    # turn it into a list of lists...
+    m, n = bottom - top + 1, right - left + 1
+    css = [cs[i * n:(i + 1) * n] for i in range(m)]
+    return css
+
+  def put(self, i, j, xss):
+    # put a list of lists at topleft i, j
+    xss = list(map(list, xss))
+    m = len(xss)
+    for xs in xss:
+      n = len(xs)
+      cs, = self.range(i, j, i, j + n - 1)
+      for c, x in eqzip(cs, xs):
+        c.value = x
+      i += 1
+      self.backlog.extend(cs)
+
+  def get(self, i, j, m, n):
+    css = self.range(i, j, i + m - 1, j + n - 1)
+    return [[c.value for c in cs] for cs in css]
+
+  def flush(self):
+    backlog, self.backlog = self.backlog, []
+    if  backlog:
+      self.worksheet.update_cells(backlog)
 
 class BaseAggregate(object):
   def __call__(self, x):
@@ -260,18 +400,18 @@ if __name__ == "__main__":
     b = np.zeros((k,))
 
     E.declare("h", operation="append", backends="numpy sheets")
-    E.declare("loss", operation="append", backends="numpy sheets".split())
+    E.declare("loss", operation="append", backends="numpy sheets")
     E.declare("median_loss",
               aggregate=MedianAggregate(),
               operation="append",
-              backends="numpy sheets".split())
+              backends="numpy sheets")
 
-    # TODO: for t in E.clock("t"):
-    for t in range(T):
+    for t in E.clock("t"):
       x = np.random.rand(k)
       h = np.dot(h, w) + np.dot(x, v) + b
       loss = np.sum(h**2)
       E.trackers.h(h)
       E.trackers.loss(loss)
       print("t", t, "loss", loss)
+      E.flush()
       time.sleep(1)
