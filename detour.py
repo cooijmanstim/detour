@@ -62,7 +62,8 @@ class Launch(Main):
     stage = tempfile.mkdtemp()
 
     tree_zip_path = os.path.join(stage, "tree.zip")
-    sp.check_call(["zip", "-r", tree_zip_path, ".",
+    sp.check_call(["zip", "-ry", tree_zip_path, ".",
+                   "--exclude", "*__pycache__*",
                    "--exclude", ".git/*",
                    "--exclude", "*/.git/*",
                    "--exclude", "%s/*" % DETOURS,
@@ -87,7 +88,7 @@ class Launch(Main):
     shutil.move(stage, workdir)
     # TODO: how to do "latest" nicely if we're launching a bunch of things?
     # maybe take a --nickname argument to get a custom latest_<nickname> link
-    sp.check_call(["ln", "-sf", label, "latest"], cwd=DETOURS)
+    sp.check_call(["ln", "-sfn", label, "latest"], cwd=DETOURS)
 
     # upload to drive
     # TODO: push in a separate process, then make pull blocking.
@@ -95,11 +96,15 @@ class Launch(Main):
 
     childpid = os.fork()
     if childpid == 0:
+      # TODO: not useful until we also push periodically on the other end
+      return
       while True:
         time.sleep(30)
         # sync periodically
         pull(label, workdir)
-        sp.check_call("unzip tree.zip", cwd=workdir)
+        sp.check_call("unzip -u tree.zip".split(),
+                      stdin=sp.DEVNULL,
+                      cwd=workdir)
     else:
       # jump through ssh hoops to launch job
       if run_locally:
@@ -116,7 +121,7 @@ class Launch(Main):
     # or just sync at this point?
     # for live plotting might use google sheets anyway
     pull(label, workdir)
-    sp.check_call("unzip tree.zip".split(), cwd=workdir)
+    sp.check_call("unzip -u tree.zip".split(), cwd=workdir)
 
 class DealWithScreen(Main):
   @staticmethod
@@ -127,8 +132,16 @@ class DealWithScreen(Main):
     args = parser.parse_args(argv)
 
     rundir = get_rundir(args.label)
-    os.makedirs(rundir)
-    assert os.path.exists(rundir)
+
+    while True:
+      try:
+        os.makedirs(rundir)
+      except OSError as ex:
+        if "Key has expired" in str(ex):
+          sp.check_call("kinit")
+      else:
+        break
+
     nextstage = "run" if run_locally else "dealwithslurm"
     screenlabel = "detour_%s" % args.label
     sp.check_call(["pkscreen", "-S", screenlabel,
@@ -151,7 +164,7 @@ class DealWithSlurm(Main):
 
     args = parser.parse_args(argv)
 
-    sp.check_call(["sinter", "--gres=gpu", "-Cgpu12gb", "--qos=high", "-t", "60",
+    sp.check_call(["sinter", "--gres=gpu", "-Cgpu12gb", "--qos=unkillable",
                    "--exclude=mila01",
                    "--exclude=eos13",
                    "sh", "-c", "detour dealwithconda %s" % args.label])
@@ -188,11 +201,15 @@ class Run(Main):
       invocation = json.load(invocation_file)
 
     # TODO: capture stdout/stderr without breaking interactivity
+    # TODO: sync periodically
     sp.check_call(invocation, cwd=os.path.join(rundir, "tree"))
+
+    # FIXME what if ssh dies during invocation??
 
     # update the tree.zip to reflect changes made by the program
     # excluding large files (eg. checkpoints)
-    sp.check_call("find * -type f -not -size +100M | zip ../tree.zip --names-stdin",
+    # FIXME exclude __pycache__ moare betterlye
+    sp.check_call("find * -type f -not -size +100M | grep -v __pycache__ | zip ../tree.zip --names-stdin",
                   cwd=os.path.join(rundir, "tree"), shell=True)
 
     push(args.label, os.path.join(rundir, "tree.zip"))
