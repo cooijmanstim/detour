@@ -6,31 +6,31 @@ DETOURS = ".detours"
 
 run_locally = False
 
+# job dependencies are considered to be everything in the current directory, except
+# hidden files and __pycache__
+# TODO and large files
+find_filter = "-not -path */\.* -and -not -path */__pycache__/*".strip().split()
+rsync_filter = "--exclude .* --exclude __pycache__".split()
+
 logger = logging.Logger("detour")
 logger.setLevel(logging.INFO)
 
-rclone = os.path.join(os.environ["HOME"], "bin", "rclone")
-rclone_remote = "experiments"
-
 if run_locally:
   work_root = "/home/tim/detours"
+  ssh_path_prefix = ""
 else:
   work_root = "/data/milatmp1/cooijmat/detours"
+  ssh_path_prefix = "elisa3:"
 
 def get_rundir(label):
   return os.path.join(work_root, label)
 
-def push(label, source_path):
-  target_path = "%s:runs/%s" % (rclone_remote, label)
-  sp.check_call([rclone, "copy", source_path, target_path])
-
-def pull(label, target_path):
-  source_path = "%s:runs/%s" % (rclone_remote, label)
-  sp.check_call([rclone, "copy", source_path, target_path])
+def get_screenlabel(label):
+  return "detour_%s" % label
 
 # -_______________-
 def activate_environment(name, env):
-  env["CONDA_DEFAULT_ENV"] = "py36"
+  env["CONDA_DEFAULT_ENV"] = name
   env["CONDA_PATH_BACKUP"] = env["PATH"]
   env["CONDA_PREFIX"] = os.path.join(env["HOME"], ".conda", "envs", name)
   env["PATH"] = "%s:%s" % (os.path.join(env["CONDA_PREFIX"], "bin"), env["PATH"])
@@ -51,119 +51,92 @@ class Launch(Main):
     # ask for experiment notes if flag
 
     invocation = args.invocation
-
-    # file dependencies are considered to be everything in the current directory
     timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-
-    assert logger.isEnabledFor(logging.INFO) # still no output -_-
-    logger.warn("invocation: %r", invocation)
-    logger.warn("timestamp: %r", timestamp)
-
-    stage = tempfile.mkdtemp()
-
-    tree_zip_path = os.path.join(stage, "tree.zip")
-    sp.check_call(["zip", "-ry", tree_zip_path, ".",
-                   "--exclude", "*__pycache__*",
-                   "--exclude", ".git/*",
-                   "--exclude", "*/.git/*",
-                   "--exclude", "%s/*" % DETOURS,
-                   "--exclude", "*/%s/*" % DETOURS])
-
-    invocation_path = os.path.join(stage, "invocation.json")
-    with open(invocation_path, "w") as invocation_file:
-      json.dump(invocation, invocation_file)
-
-    # make sure we're not inadvertently uploading big things
-    assert os.path.getsize(tree_zip_path) < 1000000 # bytes
-
-    # generate a name based on timestamp, invocation and hp/code hash
+    checksum_output = sp.check_output(
+      "|".join([
+        # would prefer to use find -print0 and tar --null, but the latter doesn't seem to work
+        "find . -type f '%s'" % "' '".join(find_filter),
+        "tar -cf - --no-recursion --files-from=- --verbatim-files-from",
+        "sha256sum",
+      ]),
+      shell=True)
     # (shortened to 128 bits or 32 hex characters to fit in screen's session name limit)
-    treehash = (sp.check_output(["sha256sum", tree_zip_path]).decode()
-                .splitlines()[0].split()[0])[:32]
-    label = "%s_%s" % (timestamp, treehash)
+    checksum = checksum_output.decode().splitlines()[0].split()[0][:32]
+
+    label = "%s_%s" % (timestamp, checksum)
+
+    logger.warn("invocation: %r", invocation)
     logger.warn("label: %r", label)
 
-    os.makedirs(DETOURS, exist_ok=True)
     workdir = os.path.join(DETOURS, label)
-    shutil.move(stage, workdir)
+    os.makedirs(workdir, exist_ok=True)
     # TODO: how to do "latest" nicely if we're launching a bunch of things?
     # maybe take a --nickname argument to get a custom latest_<nickname> link
     sp.check_call(["ln", "-sfn", label, "latest"], cwd=DETOURS)
 
-    # upload to drive
-    # TODO: push in a separate process, then make pull blocking.
-    push(label, workdir)
+    invocation_path = os.path.join(workdir, "invocation.json")
+    with open(invocation_path, "w") as invocation_file:
+      json.dump(invocation, invocation_file)
+
+    sp.check_call(["rsync", "-a", "."] + rsync_filter + [os.path.join(workdir, "tree")])
+    sp.check_call(["find", workdir])
+    import pdb; pdb.set_trace()
+
+    sp.check_call(["detour", "push", label])
 
     childpid = os.fork()
     if childpid == 0:
-      # TODO: not useful until we also push periodically on the other end
-      return
       while True:
         time.sleep(30)
-        # sync periodically
-        pull(label, workdir)
-        sp.check_call("unzip -u tree.zip".split(),
-                      stdin=sp.DEVNULL,
-                      cwd=workdir)
+        sp.check_call(["detour", "pull", label],
+                      stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
     else:
-      # jump through ssh hoops to launch job
-      if run_locally:
-        sp.check_call(["detour", "dealwithscreen", label])
-      else:
-        rundir = get_rundir(label)
-        sp.check_call(["scp", os.path.realpath(sys.argv[0]), "elisa3:bin/detour"])
-        sp.check_call(["ssh", "-t", "elisa3", "detour", "dealwithscreen", label])
+      try:
+        sp.check_call(["detour", "dealwithscreen" if run_locally else "dealwithssh", label])
+      finally:
+        os.kill(childpid, signal.SIGTERM)
+        os.waitpid(childpid, 0)
+    sp.check_call(["detour", "pull", label])
 
-      os.kill(childpid, signal.SIGTERM)
-      os.waitpid(childpid, 0)
-
-    # fork above then watch folder if flag?
-    # or just sync at this point?
-    # for live plotting might use google sheets anyway
-    pull(label, workdir)
-    sp.check_call("unzip -u tree.zip".split(), cwd=workdir)
+class DealWithSsh(Main):
+  @staticmethod
+  def __call__(argv):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("label")
+    args = parser.parse_args(argv)
+    rundir = get_rundir(args.label)
+    sp.check_call(["pshaw", "mila", "scp", os.path.realpath(sys.argv[0]), "elisa3:bin/detour"])
+    sp.check_call(["pshaw", "mila", "ssh", "-t", "elisa3", "detour", "dealwithscreen", args.label])
 
 class DealWithScreen(Main):
   @staticmethod
   def __call__(argv):
     parser = argparse.ArgumentParser()
     parser.add_argument("label")
-
     args = parser.parse_args(argv)
-
     rundir = get_rundir(args.label)
 
-    while True:
-      try:
-        os.makedirs(rundir)
-      except OSError as ex:
-        if "Key has expired" in str(ex):
-          sp.check_call("kinit")
-      else:
-        break
+    os.makedirs(rundir, exist_ok=True)
 
     nextstage = "run" if run_locally else "dealwithslurm"
-    screenlabel = "detour_%s" % args.label
-    sp.check_call(["pkscreen", "-S", screenlabel,
-                   "sh", "-c",
-                   "detour %s %s; exec bash" % (nextstage, args.label)],
+    screenlabel = get_screenlabel(args.label)
+    sp.check_call(["pkscreen", "-S", screenlabel], cwd=rundir)
+    # `stuff` sends the given string to stdin, i.e. we run the command as if the user had typed it.
+    # the benefit is that we can attach and we are in a bash prompt with exactly the same
+    # environment as the program ran in (as opposed to would be the case with some other ways of
+    # keeping the screen window alive after the program terminates)
+    sp.check_call(["screen", "-S", screenlabel, "-p", "0", "-X", "stuff",
+                   "detour %s %s^M" % (nextstage, args.label)],
                   cwd=rundir)
-    # TODO: in separate screen window (?) watch rundir and sync changes
-    # FIXME "sync"ing will have to mean zipping up the tree and copying it over,
-    # so rclone can't actually avoid copying things that didn't change. no way
-    # to do this efficiently without having lots of files (i.e. avoiding zip)
-    # or having an archive+drive aware rclone backend.
     sp.check_call(["screen", "-x", screenlabel],
-                  cwd=rundir, env=dict(TERM="xterm-color"))
+                  env=dict(TERM="xterm-color"))
 
 class DealWithSlurm(Main):
   @staticmethod
   def __call__(argv):
     parser = argparse.ArgumentParser()
     parser.add_argument("label")
-
     args = parser.parse_args(argv)
-
     sp.check_call(["sinter", "--gres=gpu", "-Cgpu12gb", "--qos=unkillable",
                    "--exclude=mila01",
                    "--exclude=eos13",
@@ -174,12 +147,9 @@ class DealWithConda(Main):
   def __call__(argv):
     parser = argparse.ArgumentParser()
     parser.add_argument("label")
-
     args = parser.parse_args(argv)
-
     env = dict(os.environ)
     env = activate_environment("py36", env)
-
     sp.check_call(["detour", "run", args.label], env=env)
 
 class Run(Main):
@@ -187,41 +157,67 @@ class Run(Main):
   def __call__(argv):
     parser = argparse.ArgumentParser()
     parser.add_argument("label")
-
     args = parser.parse_args(argv)
-
     rundir = get_rundir(args.label)
-
-    # download from drive
-    pull(args.label, rundir)
-
-    sp.check_call("unzip tree.zip -d tree".split(), cwd=rundir)
-  
     with open(os.path.join(rundir, "invocation.json")) as invocation_file:
       invocation = json.load(invocation_file)
-
+    env = dict(os.environ)
+    env["DETOUR_LABEL"] = args.label
     # TODO: capture stdout/stderr without breaking interactivity
-    # TODO: sync periodically
-    sp.check_call(invocation, cwd=os.path.join(rundir, "tree"))
+    sp.check_call(invocation, cwd=os.path.join(rundir, "tree"), env=env)
 
-    # FIXME what if ssh dies during invocation??
+class Pull(Main):
+  @staticmethod
+  def __call__(argv):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("label")
+    args = parser.parse_args(argv)
+    localdir = os.path.join(DETOURS, args.label)
+    # TODO: if no argument given, sync all dirs under .detours
+    remotedir = get_rundir(args.label)
+    sp.check_call(["pshaw", "mila", "rsync", "-avz"] + rsync_filter + ["%s%s/" % (ssh_path_prefix, remotedir), localdir])
 
-    # update the tree.zip to reflect changes made by the program
-    # excluding large files (eg. checkpoints)
-    # FIXME exclude __pycache__ moare betterlye
-    sp.check_call("find * -type f -not -size +100M | grep -v __pycache__ | zip ../tree.zip --names-stdin",
-                  cwd=os.path.join(rundir, "tree"), shell=True)
+class Push(Main):
+  @staticmethod
+  def __call__(argv):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("label")
+    args = parser.parse_args(argv)
+    localdir = os.path.join(DETOURS, args.label)
+    remotedir = get_rundir(args.label)
+    sp.check_call(["pshaw", "mila", "rsync", "-avz"] + rsync_filter + ["%s/" % localdir, "%s%s" % (ssh_path_prefix, remotedir)])
 
-    push(args.label, os.path.join(rundir, "tree.zip"))
+class Attach(Main):
+  @staticmethod
+  def __call__(argv):
+    assert not run_locally
+    parser = argparse.ArgumentParser()
+    parser.add_argument("label")
+    args = parser.parse_args(argv)
+    rundir = get_rundir(args.label)
+    childpid = os.fork()
+    if childpid == 0:
+      while True:
+        sp.check_call(["detour", "pull", args.label],
+                      stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+        time.sleep(30)
+    else:
+      try:
+        sp.check_call(["pshaw", "mila", "ssh", "-t", "elisa3", "screen", "-x", get_screenlabel(args.label)])
+      finally:
+        os.kill(childpid, signal.SIGTERM)
+        os.waitpid(childpid, 0)
+    sp.check_call(["detour", "pull", args.label])
 
 def main(argv):
   # usage: detour <command> [command args...]
   #logger.warn("argv %r", argv)
   return dict(launch=Launch,
+              dealwithssh=DealWithSsh,
               dealwithscreen=DealWithScreen,
               dealwithslurm=DealWithSlurm,
               dealwithconda=DealWithConda,
-              run=Run)[argv[1]]()(argv[2:])
+              run=Run, pull=Pull, push=Push, attach=Attach)[argv[1]]()(argv[2:])
 
 if __name__ == "__main__":
   main(sys.argv)
