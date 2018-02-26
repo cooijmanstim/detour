@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 import argparse, datetime, json, logging, os, shutil, signal, sys, tempfile, time
 import subprocess as sp
+import contextlib
+from pathlib import Path
 
 DETOURS = ".detours"
 
 run_locally = False
 
 # job dependencies are considered to be everything in the current directory, except
-# hidden files and __pycache__
+# hidden files and __pycache__ and notebooks
 # TODO and large files
-find_filter = "-not -path */\.* -and -not -path */__pycache__/*".strip().split()
-rsync_filter = "--exclude .* --exclude __pycache__".split()
+find_filter = "-not -path */.* -and -not -path */__pycache__/* -and -not -name *.npz*-numpy.npy -and -not -name *.ipynb".strip().split()
+rsync_filter = "--exclude .* --exclude __pycache__ --exclude *.npz*-numpy.npy --exclude *.ipynb".split()
 
 logger = logging.Logger("detour")
 logger.setLevel(logging.INFO)
@@ -28,6 +30,10 @@ def get_rundir(label):
 def get_screenlabel(label):
   return "detour_%s" % label
 
+def interruptible_sleep(seconds):
+  for second in range(seconds):
+    time.sleep(1)
+
 # -_______________-
 def activate_environment(name, env):
   env["CONDA_DEFAULT_ENV"] = name
@@ -36,6 +42,32 @@ def activate_environment(name, env):
   env["PATH"] = "%s:%s" % (os.path.join(env["CONDA_PREFIX"], "bin"), env["PATH"])
   return env
 
+@contextlib.contextmanager
+def synchronization(label):
+  rundir = get_rundir(label)
+  childpid = os.fork()
+  if childpid == 0:
+    while True:
+      interruptible_sleep(30)
+      sp.check_call(["detour", "pull", label],
+                    stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+      if Path(rundir, "terminated").exists():
+        break
+  else:
+    try:
+      yield
+    finally:
+      os.kill(childpid, signal.SIGTERM)
+      logger.warn("waiting...")
+      os.waitpid(childpid, 0)
+      logger.warn("waited.")
+
+  if not Path(rundir, "terminated").exists():
+    logger.warn("pulling...")
+    sp.check_call(["detour", "pull", label],
+                  stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+    logger.warn("pulled.")
+
 class Main(object):
   pass
 
@@ -43,7 +75,6 @@ class Launch(Main):
   @staticmethod
   def __call__(argv):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--watch", action="store_true")
     parser.add_argument("invocation", nargs="*")
 
     args = parser.parse_args(argv)
@@ -56,7 +87,7 @@ class Launch(Main):
       "|".join([
         # would prefer to use find -print0 and tar --null, but the latter doesn't seem to work
         "find . -type f '%s'" % "' '".join(find_filter),
-        "tar -cf - --no-recursion --files-from=- --verbatim-files-from",
+        "tar -cf - --no-recursion --verbatim-files-from --files-from=-",
         "sha256sum",
       ]),
       shell=True)
@@ -79,24 +110,13 @@ class Launch(Main):
       json.dump(invocation, invocation_file)
 
     sp.check_call(["rsync", "-a", "."] + rsync_filter + [os.path.join(workdir, "tree")])
-    sp.check_call(["find", workdir])
-    import pdb; pdb.set_trace()
 
+    logger.warn("pushing...")
     sp.check_call(["detour", "push", label])
+    logger.warn("pushed.")
 
-    childpid = os.fork()
-    if childpid == 0:
-      while True:
-        time.sleep(30)
-        sp.check_call(["detour", "pull", label],
-                      stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
-    else:
-      try:
-        sp.check_call(["detour", "dealwithscreen" if run_locally else "dealwithssh", label])
-      finally:
-        os.kill(childpid, signal.SIGTERM)
-        os.waitpid(childpid, 0)
-    sp.check_call(["detour", "pull", label])
+    with synchronization(label):
+      sp.check_call(["detour", "dealwithscreen" if run_locally else "dealwithssh", label])
 
 class DealWithSsh(Main):
   @staticmethod
@@ -120,13 +140,16 @@ class DealWithScreen(Main):
 
     nextstage = "run" if run_locally else "dealwithslurm"
     screenlabel = get_screenlabel(args.label)
+    # this branch drops the user back into remote shell when the command terminates.
     sp.check_call(["pkscreen", "-S", screenlabel], cwd=rundir)
-    # `stuff` sends the given string to stdin, i.e. we run the command as if the user had typed it.
-    # the benefit is that we can attach and we are in a bash prompt with exactly the same
+    # `stuff` sends the given string to stdin, i.e. we run the command as if the user had typed
+    # it.  the benefit is that we can attach and we are in a bash prompt with exactly the same
     # environment as the program ran in (as opposed to would be the case with some other ways of
     # keeping the screen window alive after the program terminates)
+    # NOTE: too bad the command is "detour dealwithslurm ..." which isn't really helpful
+    # NOTE: && exit ensures screen terminates iff the command terminated successfully.
     sp.check_call(["screen", "-S", screenlabel, "-p", "0", "-X", "stuff",
-                   "detour %s %s^M" % (nextstage, args.label)],
+                   "detour %s %s && exit^M" % (nextstage, args.label)],
                   cwd=rundir)
     sp.check_call(["screen", "-x", screenlabel],
                   env=dict(TERM="xterm-color"))
@@ -137,10 +160,15 @@ class DealWithSlurm(Main):
     parser = argparse.ArgumentParser()
     parser.add_argument("label")
     args = parser.parse_args(argv)
-    sp.check_call(["sinter", "--gres=gpu", "-Cgpu12gb", "--qos=unkillable",
-                   "--exclude=mila01",
-                   "--exclude=eos13",
-                   "sh", "-c", "detour dealwithconda %s" % args.label])
+    excluded_hosts = [
+      "mila00", # requires nvidia acknowledgement
+      "mila01", # requires nvidia acknowledgement
+      "bart13",
+    ]
+    sp.check_call(["sinter", "--gres=gpu", "-Cgpu12gb", "--qos=unkillable", "--mem=16G",
+                   "--exclude=%s" % ",".join(excluded_hosts),
+                   # bash complains about some ioctl mystery, but it's fine
+                   "bash", "-lic", "detour dealwithconda %s" % args.label])
 
 class DealWithConda(Main):
   @staticmethod
@@ -149,7 +177,7 @@ class DealWithConda(Main):
     parser.add_argument("label")
     args = parser.parse_args(argv)
     env = dict(os.environ)
-    env = activate_environment("py36", env)
+    env = activate_environment("py36test", env)
     sp.check_call(["detour", "run", args.label], env=env)
 
 class Run(Main):
@@ -159,12 +187,16 @@ class Run(Main):
     parser.add_argument("label")
     args = parser.parse_args(argv)
     rundir = get_rundir(args.label)
-    with open(os.path.join(rundir, "invocation.json")) as invocation_file:
-      invocation = json.load(invocation_file)
-    env = dict(os.environ)
-    env["DETOUR_LABEL"] = args.label
-    # TODO: capture stdout/stderr without breaking interactivity
-    sp.check_call(invocation, cwd=os.path.join(rundir, "tree"), env=env)
+    try:
+      with open(os.path.join(rundir, "invocation.json")) as invocation_file:
+        invocation = json.load(invocation_file)
+      env = dict(os.environ)
+      env["DETOUR_LABEL"] = args.label
+      # TODO: capture stdout/stderr without breaking interactivity
+      sp.check_call(invocation, cwd=os.path.join(rundir, "tree"), env=env)
+    finally:
+      # touch a file to indicate the process has terminated
+      Path(rundir, "terminated").touch()
 
 class Pull(Main):
   @staticmethod
@@ -195,19 +227,8 @@ class Attach(Main):
     parser.add_argument("label")
     args = parser.parse_args(argv)
     rundir = get_rundir(args.label)
-    childpid = os.fork()
-    if childpid == 0:
-      while True:
-        sp.check_call(["detour", "pull", args.label],
-                      stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
-        time.sleep(30)
-    else:
-      try:
-        sp.check_call(["pshaw", "mila", "ssh", "-t", "elisa3", "screen", "-x", get_screenlabel(args.label)])
-      finally:
-        os.kill(childpid, signal.SIGTERM)
-        os.waitpid(childpid, 0)
-    sp.check_call(["detour", "pull", args.label])
+    with synchronization(args.label):
+      sp.check_call(["pshaw", "mila", "ssh", "-t", "elisa3", "screen", "-x", get_screenlabel(args.label)])
 
 def main(argv):
   # usage: detour <command> [command args...]
