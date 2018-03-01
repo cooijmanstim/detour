@@ -43,7 +43,7 @@ def main(argv):
   # NOTE: in push/pull/attach the remote has to be figured out from metadata in the rundir, but
   # these have lower weight than values from the environment, which in turn have lower weight than
   # values from command-line arguments.
-  config = Config.from_env(os.environ)
+  config = Config()
   print("from env", config.__dict__)
   argv = config.parse_args(argv[2:])
   print("from argv", config.__dict__)
@@ -62,7 +62,7 @@ class Config(object):
   # in order to be able to invoke ourselves locally and remotely and in ways that must be robust to
   # several levels of string mangling, this object deals with what would otherwise just be flags.
   keys = "label remote bypass".split()
-  defaults = dict(bypass=0)
+  defaults = dict(label=None, remote=None, bypass=0)
 
   def __init__(self, items=(), **kwargs):
     self.__dict__.update(Config.defaults)
@@ -107,7 +107,7 @@ class Config(object):
     return argv
 
   def to_argv(self, subcommand):
-    return ([subcommand] +
+    return (["detour", subcommand] +
             ["%s:%s" % (key, getattr(self, key))
              for key in Config.keys if hasattr(self, key)])
 
@@ -127,23 +127,23 @@ def get_remote(key):
   remotes = dict()
 
   def register_remote(klass):
-    key = re.sub("Remote$", "", klass.__name__).lower()
-    remotes[key] = klass
+    remotes[klass.__name__] = klass
+    return klass
 
   @register_remote
-  class LocalRemote(Remote):
+  class local(Remote):
     ssh_wrapper = "pshaw local".split()
     host = "localhost"
     runsdir = Path("/home/tim/detours")
 
   @register_remote
-  class MilaRemote(Remote):
+  class mila(Remote):
     ssh_wrapper = "pshaw mila".split()
     host = "elisa3"
     runsdir = Path("/data/milatmp1/cooijmat/detours")
 
   @register_remote
-  class CedarRemote(Remote):
+  class cedar(Remote):
     ssh_wrapper = "pshaw cedar".split()
     host = "cedar"
     runsdir = Path("/home/cooijmat/projects/rpp-bengioy")
@@ -152,7 +152,6 @@ def get_remote(key):
   return remotes[key]()
 
 
-@contextlib.contextmanager
 class Remote(object):
   def rundir(self, label): return Path(self.runsdir, label)
   def ssh_rundir(self, label): return "%s:%s" % (self.host, self.rundir(label))
@@ -199,7 +198,7 @@ class Remote(object):
     # it.  the benefit is that we can attach and we are in a bash prompt with exactly the same
     # environment as the program ran in (as opposed to would be the case with some other ways of
     # keeping the screen window alive after the program terminates)
-    # NOTE: too bad the command is "detour" which isn't really helpful
+    # NOTE: too bad the command is "detour ..." which isn't really helpful
     # NOTE: && exit ensures screen terminates iff the command terminated successfully.
     sp.check_call(["screen", "-S", screenlabel, "-p", "0", "-X", "stuff",
                    "%s && exit^M" % " ".join(config.to_argv("enter_job"))],
@@ -221,8 +220,10 @@ class Remote(object):
                    "bash", "-lic", " ".join(config.to_argv("enter_conda"))])
 
   def enter_conda(self, config):
-    sp.check_call(config.to_argv("run"),
-                  env=activate_environment("py36test", os.environ))
+    env = os.environ
+    env = activate_environment("py36test", env)
+    env["DETOUR_LABEL"] = config.label
+    sp.check_call(config.to_argv("run"), env=env)
 
   def run(self, config):
     status = None
