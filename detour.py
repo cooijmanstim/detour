@@ -48,7 +48,7 @@ def main(argv):
   argv = config.parse_args(argv[2:])
   print("from argv", config.__dict__)
   if config.label and subcommand in local_subcommands:
-    config = config.with_defaults(Config.from_file(
+    config = config.with_underrides(Config.from_file(
       Path(local_runsdir, config.label, "config")))
     print("from config", config.__dict__)
 
@@ -66,22 +66,34 @@ class Config(object):
 
   def __init__(self, items=(), **kwargs):
     self.__dict__.update(Config.defaults)
+    self.override(items, **kwargs)
+    assert not self.bypass # not sure it works currently but don't want to get rid of it
+
+  def override(self, items=(), **kwargs):
     if isinstance(items, Config):
       items = items.__dict__
     self.__dict__.update(items)
     self.__dict__.update(kwargs)
-    assert not self.bypass # not sure it works currently but don't want to get rid of it
 
-  def updated(self, items=(), **kwargs):
-    # `kwargs` overrides `items` overrides `self`
+  def underride(self, items=(), **kwargs):
     if isinstance(items, Config):
       items = items.__dict__
-    config = Config(Config(self, **dict(items)), **kwargs)
+    if isinstance(items, collections.abc.Mapping):
+      items = items.items()
+    for key, value in it.chain(kwargs.items(), items):
+      self.__dict__.setdefault(key, value)
+
+  def with_overrides(self, items=(), **kwargs):
+    # `kwargs` overrides `items` overrides `self`
+    config = Config(self)
+    config.override(items, **kwargs)
     return config
 
-  def with_defaults(self, items=(), **kwargs):
+  def with_underrides(self, items=(), **kwargs):
     # `self` overrides `kwargs` overrides `items`
-    return Config(items, **kwargs).updated(self)
+    config = Config(self)
+    config.underride(items, **kwargs)
+    return config
 
   @staticmethod
   def from_file(path):
@@ -176,7 +188,7 @@ class Remote(object):
     # NOTE it's a long way from `launch` to `run`:
     # launch -> enter_ssh -> enter_screen -> enter_job -> enter_conda -> run
     label = self.prepare_launch(argv)
-    config = config.updated(label=label)
+    config = config.with_overrides(label=label)
     self.push(config)
     with self.synchronization(config):
       self.enter_ssh(config)
