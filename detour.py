@@ -61,8 +61,8 @@ def main(argv):
 class Config(object):
   # in order to be able to invoke ourselves locally and remotely and in ways that must be robust to
   # several levels of string mangling, this object deals with what would otherwise just be flags.
-  keys = "label remote bypass_ssh".split()
-  defaults = dict(bypass_ssh=0)
+  keys = "label remote bypass".split()
+  defaults = dict(bypass=0)
 
   def __init__(self, items=(), **kwargs):
     self.__dict__.update(Config.defaults)
@@ -70,7 +70,7 @@ class Config(object):
       items = items.__dict__
     self.__dict__.update(items)
     self.__dict__.update(kwargs)
-    assert not self.bypass_ssh # not sure it works currently but don't want to get rid of it
+    assert not self.bypass # not sure it works currently but don't want to get rid of it
 
   def updated(self, items=(), **kwargs):
     # `kwargs` overrides `items` overrides `self`
@@ -182,7 +182,7 @@ class Remote(object):
     with self.synchronization(config):
       self.enter_ssh(config)
 
-  # FIXME specialize: LocalRemote has this as a no-op if config.bypass_ssh
+  # FIXME specialize: LocalRemote has this as a no-op if config.bypass
   def enter_ssh(self, config):
     detour_program = os.path.realpath(sys.argv[0])
     sp.check_call(self.ssh_wrapper + ["scp", detour_program, "%s:bin/detour" % self.host])
