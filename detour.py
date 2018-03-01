@@ -1,31 +1,299 @@
 #!/usr/bin/env python3
-import argparse, datetime, json, logging, os, shutil, signal, sys, tempfile, time
-import subprocess as sp
+import argparse, datetime, json, logging, os, shutil, signal, sys, tempfile, time, re, pdb
+import subprocess as sp, traceback as tb
 import contextlib
 from pathlib import Path
-
-DETOURS = ".detours"
-
-run_locally = False
-
-# job dependencies are considered to be everything in the current directory, except
-# hidden files and __pycache__ and notebooks
-# TODO and large files
-find_filter = "-not -path */.* -and -not -path */__pycache__/* -and -not -name *.npz*-numpy.npy -and -not -name *.ipynb".strip().split()
-rsync_filter = "--exclude .* --exclude __pycache__ --exclude *.npz*-numpy.npy --exclude *.ipynb".split()
+from collections import OrderedDict as ordict
 
 logger = logging.Logger("detour")
 logger.setLevel(logging.INFO)
 
-if run_locally:
-  work_root = "/home/tim/detours"
-  ssh_path_prefix = ""
-else:
-  work_root = "/data/milatmp1/cooijmat/detours"
-  ssh_path_prefix = "elisa3:"
+# job dependencies are considered to be everything in the current directory, except
+# hidden files and __pycache__ and notebooks
+# TODO and large files
+find_filter = """
+  -not -path */.* -and
+  -not -path */__pycache__/* -and
+  -not -name *.npz*-numpy.npy -and
+  -not -name *.ipynb
+""".strip().split()
+rsync_filter = """
+  --exclude .*
+  --exclude __pycache__
+  --exclude *.npz*-numpy.npy
+  --exclude *.ipynb
+""".strip().split()
 
-def get_rundir(label):
-  return os.path.join(work_root, label)
+local_runsdir = ".detours"
+local_subcommands = "launch attach push pull".split()
+
+def pdb_post_mortem(fn):
+  def wfn(*args, **kwargs):
+    try:
+      return fn(*args, **kwargs)
+    except:
+      tb.print_exc()
+      pdb.post_mortem()
+      raise
+  return wfn
+
+@pdb_post_mortem
+def main(argv):
+  # NOTE: in push/pull/attach the remote has to be figured out from metadata in the rundir, but
+  # these have lower weight than values from the environment, which in turn have lower weight than
+  # values from command-line arguments.
+  config = Config.from_env(os.environ)
+  print("from env", config.__dict__)
+  argv = config.parse_args(argv[1:])
+  print("from argv", config.__dict__)
+  if config.label and config.subcommand in local_subcommands:
+    config = config.with_defaults(Config.from_file(
+      Path(local_runsdir, config.label, "config")))
+    print("from config", config.__dict__)
+
+  # NOTE: in future there may be some subcommands that don't require a remote, e.g. list jobs and states
+  assert config.remote
+
+  remotes = dict()
+  def register_remote(klass):
+    key = re.sub("Remote$", "", klass.__name__).lower()
+    remotes[key] = klass
+
+  @register_remote
+  class LocalRemote(Remote):
+    ssh_wrapper = "pshaw local".split()
+    host = "localhost"
+    runsdir = Path("/home/tim/detours")
+
+  @register_remote
+  class MilaRemote(Remote):
+    ssh_wrapper = "pshaw mila".split()
+    host = "elisa3"
+    runsdir = Path("/data/milatmp1/cooijmat/detours")
+
+  @register_remote
+  class CedarRemote(Remote):
+    ssh_wrapper = "pshaw cedar".split()
+    host = "cedar"
+    runsdir = Path("/home/cooijmat/projects/rpp-bengioy")
+    # FIXME: for cedar must chgroup rpp-bengioy all files created. bashrc?
+
+  remote = remotes[config.remote]()
+  remote.main(config, argv)
+
+class Config(object):
+  # in order to be able to invoke ourselves locally and remotely and in ways that must be robust to
+  # several levels of string mangling, this object deals with what would otherwise just be flags.
+  keys = "label remote subcommand bypass_ssh".split()
+
+  def __init__(self, items=(), **kwargs):
+    if isinstance(items, Config):
+      items = items.__dict__
+    self.__dict__.update(items)
+    self.__dict__.update(kwargs)
+    assert not self.bypass_ssh # not sure it works currently but don't want to get rid of it
+
+  @staticmethod
+  def from_env(env):
+    return Config(label=env.get("DETOUR_LABEL", None),
+                  remote=env.get("DETOUR_REMOTE", None),
+                  subcommand=env.get("DETOUR_SUBCOMMAND", None),
+                  bypass_ssh=int(env.get("DETOUR_BYPASS_SSH", "0")))
+
+  def to_env(self):
+    return dict(DETOUR_LABEL=self.label or "",
+                DETOUR_REMOTE=self.remote or "",
+                DETOUR_SUBCOMMAND=self.subcommand or "",
+                DETOUR_BYPASS_SSH=str(self.bypass_ssh))
+
+  def updated(self, items=(), **kwargs):
+    # `kwargs` overrides `items` overrides `self`
+    if isinstance(items, Config):
+      items = items.__dict__
+    config = Config(Config(self, **dict(items)), **kwargs)
+    return config
+
+  def with_defaults(self, items=(), **kwargs):
+    # `self` overrides `kwargs` overrides `items`
+    return Config(items, **kwargs).updated(self)
+
+  @staticmethod
+  def from_file(path):
+    return Config(json.loads(path.read_bytes()))
+
+  def parse_args(self, argv):
+    # arg format: subcommand (key:value )* (::)? argv
+    configdict = ordict()
+
+    configdict["subcommand"], argv = argv[0], argv[1:]
+
+    while argv and ":" in argv[0] and argv[0] != "::":
+      arg, argv = argv[0], argv[1:]
+      key, value = arg.split(":")
+      configdict[key] = parse_value(value)
+
+    if argv and argv[0] == "::":
+      argv = argv[1:]
+
+    for key, value in configdict.items():
+      if key not in Config.keys:
+        raise KeyError("unknown config key", key)
+      self.__dict__[key] = value
+
+    return argv
+
+  def to_argv(self, subcommand=None):
+    return ([subcommand or self.subcommand] +
+            ["%s:%s" % (key, getattr(self, key))
+             for key in Config.keys if hasattr(self, key)
+             and key != "subcommand"])
+
+def parse_value(s):
+  s = s.strip()
+  try:
+    return int(s)
+  except ValueError:
+    try:
+      return float(s)
+    except ValueError:
+      return s
+
+@contextlib.contextmanager
+class Remote(object):
+  def rundir(self, label): return Path(self.runsdir, label)
+  def ssh_rundir(self, label): return "%s:%s" % (self.host, self.rundir(label))
+  ssh_runsdir = property(lambda self: "%s:%s" % (self.host, self.runsdir))
+
+  def main(self, config, argv):
+    assert config.subcommand
+    return getattr(self, config.subcommand)(config, *argv)
+
+  def pull(self, config):
+    sp.check_call(self.ssh_wrapper + ["rsync", "-avz"] + rsync_filter +
+                  ["%s/" % self.ssh_rundir(config.label),
+                   "%s/%s" % (local_runsdir, config.label)])
+
+  def push(self, config):
+    sp.check_call(self.ssh_wrapper + ["rsync", "-avz"] + rsync_filter +
+                  ["%s/%s/" % (local_runsdir, config.label),
+                   self.ssh_rundir(config.label)])
+
+  def attach(self, config):
+    with self.synchronization(config):
+      sp.check_call(self.ssh_wrapper + ["ssh", "-t", self.host,
+                                        "screen", "-x", get_screenlabel(config.label)])
+
+  def launch(self, config, *argv):
+    # NOTE it's a long way from `launch` to `run`:
+    # launch -> enter_ssh -> enter_screen -> enter_job -> enter_conda -> run
+    label = self.prepare_launch(argv)
+    config = config.updated(label=label)
+    self.push(config)
+    with self.synchronization(config):
+      self.enter_ssh(config)
+
+  # FIXME specialize: LocalRemote has this as a no-op if config.bypass_ssh
+  def enter_ssh(self, config):
+    detour_program = os.path.realpath(sys.argv[0])
+    sp.check_call(self.ssh_wrapper + ["scp", detour_program, "%s:bin/detour" % self.host])
+    sp.check_call(self.ssh_wrapper + ["ssh", "-t", self.host] +
+                  config.to_argv("enter_screen"))
+
+  def enter_screen(self, config):
+    rundir = self.rundir(config.label)
+    rundir.mkdir(parents=True, exist_ok=True)
+
+    screenlabel = get_screenlabel(config.label)
+    sp.check_call(["pkscreen", "-S", screenlabel], cwd=str(rundir))
+    # `stuff` sends the given string to stdin, i.e. we run the command as if the user had typed
+    # it.  the benefit is that we can attach and we are in a bash prompt with exactly the same
+    # environment as the program ran in (as opposed to would be the case with some other ways of
+    # keeping the screen window alive after the program terminates)
+    # NOTE: too bad the command is "detour" which isn't really helpful
+    # NOTE: && exit ensures screen terminates iff the command terminated successfully.
+    sp.check_call(["screen", "-S", screenlabel, "-p", "0", "-X", "stuff",
+                   "%s && exit^M" % " ".join(config.to_argv("enter_job"))],
+                  cwd=str(rundir))
+    # FIXME specialize: don't attach on cedar
+    sp.check_call(["screen", "-x", screenlabel],
+                  env=dict(TERM="xterm-color"))
+
+  def enter_job(self, config):
+    excluded_hosts = [
+      "mila00", # requires nvidia acknowledgement
+      "mila01", # requires nvidia acknowledgement
+      "bart13", # borken for good?
+      "bart14",
+    ]
+    sp.check_call(["sinter", "--gres=gpu", "-Cgpu12gb", "--qos=unkillable", "--mem=16G",
+                   "--exclude=%s" % ",".join(excluded_hosts),
+                   # bash complains about some ioctl mystery, but it's fine
+                   "bash", "-lic", " ".join(config.to_argv("enter_conda"))])
+
+  def enter_conda(self, config):
+    sp.check_call(config.to_argv("run"),
+                  env=activate_environment("py36test", os.environ))
+
+  def run(self, config):
+    status = None
+    try:
+      invocation = json.loads(Path(self.runsdir, config.label, "invocation.json").read_text())
+      # TODO: capture stdout/stderr without breaking interactivity
+      status = sp.check_call(invocation, cwd=str(Path(self.runsdir, config.label, "tree")))
+    finally:
+      # touch a file to indicate the process has terminated
+      Path(self.runsdir, config.label, "terminated").touch()
+      # record status (separate from touch in case this crashes)
+      if status is None:
+        status = tb.format_exc()
+      Path(self.runsdir, config.label, "terminated").write_text(str(status))
+
+  # FIXME specialize: sync differently on cedar because we don't attach to screen and wait for completion
+  @contextlib.contextmanager
+  def synchronization(self, config):
+    yield
+    return
+    childpid = os.fork()
+    if childpid == 0:
+      while True:
+        interruptible_sleep(30)
+        self.pull(config)
+        #sp.check_call(config.to_argv("pull"),
+        #              stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+        if Path(local_runsdir, config.label, "terminated").exists():
+          break
+    else:
+      try:
+        yield
+      finally:
+        os.kill(childpid, signal.SIGTERM)
+        os.waitpid(childpid, 0)
+
+    if not Path(local_runsdir, config.label, "terminated").exists():
+      #sp.check_call(config.to_argv("pull"),
+      #              stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+      pass
+
+  def prepare_launch(self, invocation):
+    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    checksum_output = sp.check_output(
+      "|".join([
+        # would prefer to use find -print0 and tar --null, but the latter doesn't seem to work
+        "find . -type f '%s'" % "' '".join(find_filter),
+        "tar -cf - --no-recursion --verbatim-files-from --files-from=-",
+        "sha256sum",
+       ]),
+      shell=True)
+    # (shortened to 128 bits or 32 hex characters to fit in screen's session name limit)
+    checksum = checksum_output.decode().splitlines()[0].split()[0][:32]
+    label = "%s_%s" % (timestamp, checksum)
+    logger.warn("invocation: %r", invocation)
+    logger.warn("label: %r", label)
+    Path(local_runsdir, label).mkdir(parents=True)
+    sp.check_call(["rsync", "-a", "."] + rsync_filter +
+                  [Path(local_runsdir, label, "tree")])
+    Path(local_runsdir, label, "invocation.json").write_text(json.dumps(invocation))
+    return label
 
 def get_screenlabel(label):
   return "detour_%s" % label
@@ -34,6 +302,11 @@ def interruptible_sleep(seconds):
   for second in range(seconds):
     time.sleep(1)
 
+def udict(*mappings, **more_mappings):
+  return dict((key, value)
+              for mapping in list(mappings) + [more_mappings]
+              for key, value in dict(mapping).items())
+
 # -_______________-
 def activate_environment(name, env):
   env["CONDA_DEFAULT_ENV"] = name
@@ -41,204 +314,6 @@ def activate_environment(name, env):
   env["CONDA_PREFIX"] = os.path.join(env["HOME"], ".conda", "envs", name)
   env["PATH"] = "%s:%s" % (os.path.join(env["CONDA_PREFIX"], "bin"), env["PATH"])
   return env
-
-@contextlib.contextmanager
-def synchronization(label):
-  rundir = get_rundir(label)
-  childpid = os.fork()
-  if childpid == 0:
-    while True:
-      interruptible_sleep(30)
-      sp.check_call(["detour", "pull", label],
-                    stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
-      if Path(rundir, "terminated").exists():
-        break
-  else:
-    try:
-      yield
-    finally:
-      os.kill(childpid, signal.SIGTERM)
-      logger.warn("waiting...")
-      os.waitpid(childpid, 0)
-      logger.warn("waited.")
-
-  if not Path(rundir, "terminated").exists():
-    logger.warn("pulling...")
-    sp.check_call(["detour", "pull", label],
-                  stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
-    logger.warn("pulled.")
-
-class Main(object):
-  pass
-
-class Launch(Main):
-  @staticmethod
-  def __call__(argv):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("invocation", nargs="*")
-
-    args = parser.parse_args(argv)
-
-    # ask for experiment notes if flag
-
-    invocation = args.invocation
-    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    checksum_output = sp.check_output(
-      "|".join([
-        # would prefer to use find -print0 and tar --null, but the latter doesn't seem to work
-        "find . -type f '%s'" % "' '".join(find_filter),
-        "tar -cf - --no-recursion --verbatim-files-from --files-from=-",
-        "sha256sum",
-      ]),
-      shell=True)
-    # (shortened to 128 bits or 32 hex characters to fit in screen's session name limit)
-    checksum = checksum_output.decode().splitlines()[0].split()[0][:32]
-
-    label = "%s_%s" % (timestamp, checksum)
-
-    logger.warn("invocation: %r", invocation)
-    logger.warn("label: %r", label)
-
-    workdir = os.path.join(DETOURS, label)
-    os.makedirs(workdir, exist_ok=True)
-    # TODO: how to do "latest" nicely if we're launching a bunch of things?
-    # maybe take a --nickname argument to get a custom latest_<nickname> link
-    sp.check_call(["ln", "-sfn", label, "latest"], cwd=DETOURS)
-
-    invocation_path = os.path.join(workdir, "invocation.json")
-    with open(invocation_path, "w") as invocation_file:
-      json.dump(invocation, invocation_file)
-
-    sp.check_call(["rsync", "-a", "."] + rsync_filter + [os.path.join(workdir, "tree")])
-
-    logger.warn("pushing...")
-    sp.check_call(["detour", "push", label])
-    logger.warn("pushed.")
-
-    with synchronization(label):
-      sp.check_call(["detour", "dealwithscreen" if run_locally else "dealwithssh", label])
-
-class DealWithSsh(Main):
-  @staticmethod
-  def __call__(argv):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("label")
-    args = parser.parse_args(argv)
-    rundir = get_rundir(args.label)
-    sp.check_call(["pshaw", "mila", "scp", os.path.realpath(sys.argv[0]), "elisa3:bin/detour"])
-    sp.check_call(["pshaw", "mila", "ssh", "-t", "elisa3", "detour", "dealwithscreen", args.label])
-
-class DealWithScreen(Main):
-  @staticmethod
-  def __call__(argv):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("label")
-    args = parser.parse_args(argv)
-    rundir = get_rundir(args.label)
-
-    os.makedirs(rundir, exist_ok=True)
-
-    nextstage = "run" if run_locally else "dealwithslurm"
-    screenlabel = get_screenlabel(args.label)
-    # this branch drops the user back into remote shell when the command terminates.
-    sp.check_call(["pkscreen", "-S", screenlabel], cwd=rundir)
-    # `stuff` sends the given string to stdin, i.e. we run the command as if the user had typed
-    # it.  the benefit is that we can attach and we are in a bash prompt with exactly the same
-    # environment as the program ran in (as opposed to would be the case with some other ways of
-    # keeping the screen window alive after the program terminates)
-    # NOTE: too bad the command is "detour dealwithslurm ..." which isn't really helpful
-    # NOTE: && exit ensures screen terminates iff the command terminated successfully.
-    sp.check_call(["screen", "-S", screenlabel, "-p", "0", "-X", "stuff",
-                   "detour %s %s && exit^M" % (nextstage, args.label)],
-                  cwd=rundir)
-    sp.check_call(["screen", "-x", screenlabel],
-                  env=dict(TERM="xterm-color"))
-
-class DealWithSlurm(Main):
-  @staticmethod
-  def __call__(argv):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("label")
-    args = parser.parse_args(argv)
-    excluded_hosts = [
-      "mila00", # requires nvidia acknowledgement
-      "mila01", # requires nvidia acknowledgement
-      "bart13",
-    ]
-    sp.check_call(["sinter", "--gres=gpu", "-Cgpu12gb", "--qos=unkillable", "--mem=16G",
-                   "--exclude=%s" % ",".join(excluded_hosts),
-                   # bash complains about some ioctl mystery, but it's fine
-                   "bash", "-lic", "detour dealwithconda %s" % args.label])
-
-class DealWithConda(Main):
-  @staticmethod
-  def __call__(argv):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("label")
-    args = parser.parse_args(argv)
-    env = dict(os.environ)
-    env = activate_environment("py36test", env)
-    sp.check_call(["detour", "run", args.label], env=env)
-
-class Run(Main):
-  @staticmethod
-  def __call__(argv):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("label")
-    args = parser.parse_args(argv)
-    rundir = get_rundir(args.label)
-    try:
-      with open(os.path.join(rundir, "invocation.json")) as invocation_file:
-        invocation = json.load(invocation_file)
-      env = dict(os.environ)
-      env["DETOUR_LABEL"] = args.label
-      # TODO: capture stdout/stderr without breaking interactivity
-      sp.check_call(invocation, cwd=os.path.join(rundir, "tree"), env=env)
-    finally:
-      # touch a file to indicate the process has terminated
-      Path(rundir, "terminated").touch()
-
-class Pull(Main):
-  @staticmethod
-  def __call__(argv):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("label")
-    args = parser.parse_args(argv)
-    localdir = os.path.join(DETOURS, args.label)
-    # TODO: if no argument given, sync all dirs under .detours
-    remotedir = get_rundir(args.label)
-    sp.check_call(["pshaw", "mila", "rsync", "-avz"] + rsync_filter + ["%s%s/" % (ssh_path_prefix, remotedir), localdir])
-
-class Push(Main):
-  @staticmethod
-  def __call__(argv):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("label")
-    args = parser.parse_args(argv)
-    localdir = os.path.join(DETOURS, args.label)
-    remotedir = get_rundir(args.label)
-    sp.check_call(["pshaw", "mila", "rsync", "-avz"] + rsync_filter + ["%s/" % localdir, "%s%s" % (ssh_path_prefix, remotedir)])
-
-class Attach(Main):
-  @staticmethod
-  def __call__(argv):
-    assert not run_locally
-    parser = argparse.ArgumentParser()
-    parser.add_argument("label")
-    args = parser.parse_args(argv)
-    rundir = get_rundir(args.label)
-    with synchronization(args.label):
-      sp.check_call(["pshaw", "mila", "ssh", "-t", "elisa3", "screen", "-x", get_screenlabel(args.label)])
-
-def main(argv):
-  # usage: detour <command> [command args...]
-  #logger.warn("argv %r", argv)
-  return dict(launch=Launch,
-              dealwithssh=DealWithSsh,
-              dealwithscreen=DealWithScreen,
-              dealwithslurm=DealWithSlurm,
-              dealwithconda=DealWithConda,
-              run=Run, pull=Pull, push=Push, attach=Attach)[argv[1]]()(argv[2:])
 
 if __name__ == "__main__":
   main(sys.argv)
