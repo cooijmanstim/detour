@@ -39,22 +39,93 @@ def pdb_post_mortem(fn):
 
 @pdb_post_mortem
 def main(argv):
+  subcommand = argv[1]
   # NOTE: in push/pull/attach the remote has to be figured out from metadata in the rundir, but
   # these have lower weight than values from the environment, which in turn have lower weight than
   # values from command-line arguments.
   config = Config.from_env(os.environ)
   print("from env", config.__dict__)
-  argv = config.parse_args(argv[1:])
+  argv = config.parse_args(argv[2:])
   print("from argv", config.__dict__)
-  if config.label and config.subcommand in local_subcommands:
+  if config.label and subcommand in local_subcommands:
     config = config.with_defaults(Config.from_file(
       Path(local_runsdir, config.label, "config")))
     print("from config", config.__dict__)
 
   # NOTE: in future there may be some subcommands that don't require a remote, e.g. list jobs and states
   assert config.remote
+  remote = get_remote(config.remote)
+  getattr(remote, subcommand)(config, *argv)
 
+
+class Config(object):
+  # in order to be able to invoke ourselves locally and remotely and in ways that must be robust to
+  # several levels of string mangling, this object deals with what would otherwise just be flags.
+  keys = "label remote bypass_ssh".split()
+  defaults = dict(bypass_ssh=0)
+
+  def __init__(self, items=(), **kwargs):
+    self.__dict__.update(Config.defaults)
+    if isinstance(items, Config):
+      items = items.__dict__
+    self.__dict__.update(items)
+    self.__dict__.update(kwargs)
+    assert not self.bypass_ssh # not sure it works currently but don't want to get rid of it
+
+  def updated(self, items=(), **kwargs):
+    # `kwargs` overrides `items` overrides `self`
+    if isinstance(items, Config):
+      items = items.__dict__
+    config = Config(Config(self, **dict(items)), **kwargs)
+    return config
+
+  def with_defaults(self, items=(), **kwargs):
+    # `self` overrides `kwargs` overrides `items`
+    return Config(items, **kwargs).updated(self)
+
+  @staticmethod
+  def from_file(path):
+    return Config(json.loads(path.read_bytes()))
+
+  def parse_args(self, argv):
+    # arg format: (key:value )* (::)? argv
+    configdict = ordict()
+
+    while argv and ":" in argv[0] and argv[0] != "::":
+      arg, argv = argv[0], argv[1:]
+      key, value = arg.split(":")
+      configdict[key] = parse_value(value)
+
+    if argv and argv[0] == "::":
+      argv = argv[1:]
+
+    for key, value in configdict.items():
+      if key not in Config.keys:
+        raise KeyError("unknown config key", key)
+      self.__dict__[key] = value
+
+    return argv
+
+  def to_argv(self, subcommand):
+    return ([subcommand] +
+            ["%s:%s" % (key, getattr(self, key))
+             for key in Config.keys if hasattr(self, key)])
+
+
+def parse_value(s):
+  s = s.strip()
+  try:
+    return int(s)
+  except ValueError:
+    try:
+      return float(s)
+    except ValueError:
+      return s
+
+
+def get_remote(key):
   remotes = dict()
+
   def register_remote(klass):
     key = re.sub("Remote$", "", klass.__name__).lower()
     remotes[key] = klass
@@ -78,95 +149,14 @@ def main(argv):
     runsdir = Path("/home/cooijmat/projects/rpp-bengioy")
     # FIXME: for cedar must chgroup rpp-bengioy all files created. bashrc?
 
-  remote = remotes[config.remote]()
-  remote.main(config, argv)
+  return remotes[key]()
 
-class Config(object):
-  # in order to be able to invoke ourselves locally and remotely and in ways that must be robust to
-  # several levels of string mangling, this object deals with what would otherwise just be flags.
-  keys = "label remote subcommand bypass_ssh".split()
-
-  def __init__(self, items=(), **kwargs):
-    if isinstance(items, Config):
-      items = items.__dict__
-    self.__dict__.update(items)
-    self.__dict__.update(kwargs)
-    assert not self.bypass_ssh # not sure it works currently but don't want to get rid of it
-
-  @staticmethod
-  def from_env(env):
-    return Config(label=env.get("DETOUR_LABEL", None),
-                  remote=env.get("DETOUR_REMOTE", None),
-                  subcommand=env.get("DETOUR_SUBCOMMAND", None),
-                  bypass_ssh=int(env.get("DETOUR_BYPASS_SSH", "0")))
-
-  def to_env(self):
-    return dict(DETOUR_LABEL=self.label or "",
-                DETOUR_REMOTE=self.remote or "",
-                DETOUR_SUBCOMMAND=self.subcommand or "",
-                DETOUR_BYPASS_SSH=str(self.bypass_ssh))
-
-  def updated(self, items=(), **kwargs):
-    # `kwargs` overrides `items` overrides `self`
-    if isinstance(items, Config):
-      items = items.__dict__
-    config = Config(Config(self, **dict(items)), **kwargs)
-    return config
-
-  def with_defaults(self, items=(), **kwargs):
-    # `self` overrides `kwargs` overrides `items`
-    return Config(items, **kwargs).updated(self)
-
-  @staticmethod
-  def from_file(path):
-    return Config(json.loads(path.read_bytes()))
-
-  def parse_args(self, argv):
-    # arg format: subcommand (key:value )* (::)? argv
-    configdict = ordict()
-
-    configdict["subcommand"], argv = argv[0], argv[1:]
-
-    while argv and ":" in argv[0] and argv[0] != "::":
-      arg, argv = argv[0], argv[1:]
-      key, value = arg.split(":")
-      configdict[key] = parse_value(value)
-
-    if argv and argv[0] == "::":
-      argv = argv[1:]
-
-    for key, value in configdict.items():
-      if key not in Config.keys:
-        raise KeyError("unknown config key", key)
-      self.__dict__[key] = value
-
-    return argv
-
-  def to_argv(self, subcommand=None):
-    return ([subcommand or self.subcommand] +
-            ["%s:%s" % (key, getattr(self, key))
-             for key in Config.keys if hasattr(self, key)
-             and key != "subcommand"])
-
-def parse_value(s):
-  s = s.strip()
-  try:
-    return int(s)
-  except ValueError:
-    try:
-      return float(s)
-    except ValueError:
-      return s
 
 @contextlib.contextmanager
 class Remote(object):
   def rundir(self, label): return Path(self.runsdir, label)
   def ssh_rundir(self, label): return "%s:%s" % (self.host, self.rundir(label))
   ssh_runsdir = property(lambda self: "%s:%s" % (self.host, self.runsdir))
-
-  def main(self, config, argv):
-    assert config.subcommand
-    return getattr(self, config.subcommand)(config, *argv)
 
   def pull(self, config):
     sp.check_call(self.ssh_wrapper + ["rsync", "-avz"] + rsync_filter +
