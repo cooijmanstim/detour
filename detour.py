@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, datetime, json, logging, os, shutil, signal, sys, tempfile, time, re, pdb
+import argparse, datetime, json, logging, os, shutil, signal, sys, tempfile, time, re, pdb, textwrap
 import subprocess as sp, traceback as tb
 import contextlib
 from pathlib import Path
@@ -143,46 +143,74 @@ def get_remote(key):
     return klass
 
   @register_remote
-  class local(Remote):
+  class local(InteractiveRemote):
     ssh_wrapper = "pshaw local".split()
     host = "localhost"
     runsdir = Path("/home/tim/detours")
 
   @register_remote
-  class mila(Remote):
+  class mila(InteractiveRemote):
     ssh_wrapper = "pshaw mila".split()
     host = "elisa3"
     runsdir = Path("/data/milatmp1/cooijmat/detours")
 
   @register_remote
-  class cedar(Remote):
+  class cedar(BatchRemote):
     ssh_wrapper = "pshaw cedar".split()
     host = "cedar"
-    runsdir = Path("/home/cooijmat/projects/rpp-bengioy")
-    # FIXME: for cedar must chgroup rpp-bengioy all files created. bashrc?
+    runsdir = Path("/home/cooijmat/projects/rpp-bengioy/cooijmat/detours")
+    rsync_push_flags = ["--chown=cooijmat:rpp-bengioy"]
+
+    def push(self, config):
+      super().push(config)
+      # NOTE: for cedar must chgroup rpp-bengioy all files created; do it once after push and then
+      # rely on setgid to propagate it to things created by the job.
+      #sp.check_call(self.ssh_wrapper + ["chown", "-R", "cooijmat:rpp-bengioy",
+      #                                  self.rundir(config.label)])
+      #sp.check_call(self.ssh_wrapper + ["find", self.rundir(config.label), "-type", "d",
+      #                                  "-exec", "chmod", "g+s", "{}", ";"])
 
   return remotes[key]()
 
 
 class Remote(object):
+  rsync_push_flags = []
+
   def rundir(self, label): return Path(self.runsdir, label)
   def ssh_rundir(self, label): return "%s:%s" % (self.host, self.rundir(label))
   ssh_runsdir = property(lambda self: "%s:%s" % (self.host, self.runsdir))
 
   def pull(self, config):
-    sp.check_call(self.ssh_wrapper + ["rsync", "-avz"] + rsync_filter +
+    sp.check_call(self.ssh_wrapper + ["rsync", "-rlvz"] + rsync_filter +
                   ["%s/" % self.ssh_rundir(config.label),
                    "%s/%s" % (local_runsdir, config.label)])
 
   def push(self, config):
-    sp.check_call(self.ssh_wrapper + ["rsync", "-avz"] + rsync_filter +
+    sp.check_call(self.ssh_wrapper + ["rsync", "-rlvz"] +
+                  self.rsync_push_flags + rsync_filter +
                   ["%s/%s/" % (local_runsdir, config.label),
                    self.ssh_rundir(config.label)])
 
-  def attach(self, config):
-    with self.synchronization(config):
-      sp.check_call(self.ssh_wrapper + ["ssh", "-t", self.host,
-                                        "screen", "-x", get_screenlabel(config.label)])
+  def prepare_launch(self, invocation):
+    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    checksum_output = sp.check_output(
+      "|".join([
+        # would prefer to use find -print0 and tar --null, but the latter doesn't seem to work
+        "find . -type f '%s'" % "' '".join(find_filter),
+        "tar -cf - --no-recursion --verbatim-files-from --files-from=-",
+        "sha256sum",
+       ]),
+      shell=True)
+    # (shortened to 128 bits or 32 hex characters to fit in screen's session name limit)
+    checksum = checksum_output.decode().splitlines()[0].split()[0][:32]
+    label = "%s_%s" % (timestamp, checksum)
+    logger.warn("invocation: %r", invocation)
+    logger.warn("label: %r", label)
+    Path(local_runsdir, label).mkdir(parents=True)
+    sp.check_call(["rsync", "-a", "."] + rsync_filter +
+                  [Path(local_runsdir, label, "tree")])
+    Path(local_runsdir, label, "invocation.json").write_text(json.dumps(invocation))
+    return label
 
   def launch(self, config, *argv):
     # NOTE it's a long way from `launch` to `run`:
@@ -199,6 +227,62 @@ class Remote(object):
     sp.check_call(self.ssh_wrapper + ["scp", detour_program, "%s:bin/detour" % self.host])
     sp.check_call(self.ssh_wrapper + ["ssh", "-t", self.host] +
                   config.to_argv("enter_screen"))
+
+  def enter_conda(self, config):
+    env = os.environ
+    env = activate_environment("py36test", env)
+    env["DETOUR_LABEL"] = config.label
+    sp.check_call(config.to_argv("run"), env=env)
+
+  def run(self, config):
+    status = None
+    try:
+      invocation = json.loads(Path(self.runsdir, config.label, "invocation.json").read_text())
+      # TODO: capture stdout/stderr without breaking interactivity
+      status = sp.check_call(invocation, cwd=str(Path(self.runsdir, config.label, "tree")))
+    finally:
+      # touch a file to indicate the process has terminated
+      Path(self.runsdir, config.label, "terminated").touch()
+      # record status (separate from touch in case this crashes)
+      if status is None:
+        status = tb.format_exc()
+      Path(self.runsdir, config.label, "terminated").write_text(str(status))
+
+class BatchRemote(Remote):
+  def enter_screen(self, config):
+    # it would be nice to invoke the sbatch inside a screen just so we have a window we can attach,
+    # but it would get out of hand quickly and how would we clean it up?
+    # TODO: investigate the possibility of waiting for the job
+    self.enter_job(config)
+
+  def enter_job(self, config):
+    rundir = self.rundir(config.label)
+    rundir.mkdir(parents=True, exist_ok=True)
+
+    # make a script describing the job
+    command = " ".join(config.to_argv("enter_conda"))
+    Path(rundir, "sbatch.sh").write_text(textwrap.dedent("""
+         #!/bin/bash
+         #SBATCH --time=01:00:00
+         #SBATCH --account=rpp-bengioy
+         #SBATCH --gres=gpu:1
+         #SBATCH --mem=16G
+         #SBATCH -- are you --interpreting these at all
+         %s
+         """ % command).strip())
+
+    sp.check_call(["sbatch", "sbatch.sh"], cwd=str(rundir))
+
+  @contextlib.contextmanager
+  def synchronization(self, config):
+    # make no attempt to synchronize, because sbatch returns immediately
+    yield
+
+class InteractiveRemote(Remote):
+  def attach(self, config):
+    with self.synchronization(config):
+      sp.check_call(self.ssh_wrapper + ["ssh", "-t", self.host,
+                                        "screen", "-x", get_screenlabel(config.label)])
 
   def enter_screen(self, config):
     rundir = self.rundir(config.label)
@@ -231,26 +315,6 @@ class Remote(object):
                    # bash complains about some ioctl mystery, but it's fine
                    "bash", "-lic", " ".join(config.to_argv("enter_conda"))])
 
-  def enter_conda(self, config):
-    env = os.environ
-    env = activate_environment("py36test", env)
-    env["DETOUR_LABEL"] = config.label
-    sp.check_call(config.to_argv("run"), env=env)
-
-  def run(self, config):
-    status = None
-    try:
-      invocation = json.loads(Path(self.runsdir, config.label, "invocation.json").read_text())
-      # TODO: capture stdout/stderr without breaking interactivity
-      status = sp.check_call(invocation, cwd=str(Path(self.runsdir, config.label, "tree")))
-    finally:
-      # touch a file to indicate the process has terminated
-      Path(self.runsdir, config.label, "terminated").touch()
-      # record status (separate from touch in case this crashes)
-      if status is None:
-        status = tb.format_exc()
-      Path(self.runsdir, config.label, "terminated").write_text(str(status))
-
   # FIXME specialize: sync differently on cedar because we don't attach to screen and wait for completion
   @contextlib.contextmanager
   def synchronization(self, config):
@@ -276,27 +340,6 @@ class Remote(object):
       #sp.check_call(config.to_argv("pull"),
       #              stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
       pass
-
-  def prepare_launch(self, invocation):
-    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    checksum_output = sp.check_output(
-      "|".join([
-        # would prefer to use find -print0 and tar --null, but the latter doesn't seem to work
-        "find . -type f '%s'" % "' '".join(find_filter),
-        "tar -cf - --no-recursion --verbatim-files-from --files-from=-",
-        "sha256sum",
-       ]),
-      shell=True)
-    # (shortened to 128 bits or 32 hex characters to fit in screen's session name limit)
-    checksum = checksum_output.decode().splitlines()[0].split()[0][:32]
-    label = "%s_%s" % (timestamp, checksum)
-    logger.warn("invocation: %r", invocation)
-    logger.warn("label: %r", label)
-    Path(local_runsdir, label).mkdir(parents=True)
-    sp.check_call(["rsync", "-a", "."] + rsync_filter +
-                  [Path(local_runsdir, label, "tree")])
-    Path(local_runsdir, label, "invocation.json").write_text(json.dumps(invocation))
-    return label
 
 def get_screenlabel(label):
   return "detour_%s" % label
