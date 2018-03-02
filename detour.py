@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 import argparse, datetime, json, logging, os, shutil, signal, sys, tempfile, time, re, pdb, textwrap
-import subprocess as sp, traceback as tb
+import itertools as it, subprocess as sp, traceback as tb
 import contextlib
 from pathlib import Path
 from collections import OrderedDict as ordict
+import collections
 
 logger = logging.Logger("detour")
 logger.setLevel(logging.INFO)
@@ -49,8 +50,10 @@ def main(argv):
   print("from argv", config.__dict__)
   if config.label and subcommand in local_subcommands:
     config = config.with_underrides(Config.from_file(
-      Path(local_runsdir, config.label, "config")))
+      Path(local_runsdir, config.label, "config.json")))
     print("from config", config.__dict__)
+  # finally, add defaults
+  config.underride(Config.defaults)
 
   # NOTE: in future there may be some subcommands that don't require a remote, e.g. list jobs and states
   assert config.remote
@@ -65,9 +68,7 @@ class Config(object):
   defaults = dict(label=None, remote=None, bypass=0)
 
   def __init__(self, items=(), **kwargs):
-    self.__dict__.update(Config.defaults)
     self.override(items, **kwargs)
-    assert not self.bypass # not sure it works currently but don't want to get rid of it
 
   def override(self, items=(), **kwargs):
     if isinstance(items, Config):
@@ -97,7 +98,10 @@ class Config(object):
 
   @staticmethod
   def from_file(path):
-    return Config(json.loads(path.read_bytes()))
+    return Config(json.loads(path.read_text()))
+
+  def to_file(self, path):
+    path.write_text(json.dumps(self.__dict__))
 
   def parse_args(self, argv):
     # arg format: (key:value )* (::)? argv
@@ -119,6 +123,7 @@ class Config(object):
     return argv
 
   def to_argv(self, subcommand):
+    assert not self.bypass # not sure it works currently but don't want to get rid of it
     return (["detour", subcommand] +
             ["%s:%s" % (key, getattr(self, key))
              for key in Config.keys if hasattr(self, key)])
@@ -217,6 +222,7 @@ class Remote(object):
     # launch -> enter_ssh -> enter_screen -> enter_job -> enter_conda -> run
     label = self.prepare_launch(argv)
     config = config.with_overrides(label=label)
+    config.to_file(Path(local_runsdir, label, "config.json"))
     self.push(config)
     with self.synchronization(config):
       self.enter_ssh(config)
@@ -230,7 +236,7 @@ class Remote(object):
 
   def enter_conda(self, config):
     env = os.environ
-    env = activate_environment("py36test", env)
+    env = activate_environment("py36", env)
     env["DETOUR_LABEL"] = config.label
     sp.check_call(config.to_argv("run"), env=env)
 
