@@ -26,7 +26,6 @@ rsync_filter = """
 """.strip().split()
 
 local_runsdir = ".detours"
-local_subcommands = "launch attach push pull".split()
 
 def pdb_post_mortem(fn):
   def wfn(*args, **kwargs):
@@ -40,21 +39,28 @@ def pdb_post_mortem(fn):
 
 @pdb_post_mortem
 def main(argv):
-  subcommand = argv[1]
-  # NOTE: in push/pull/attach the remote has to be figured out from metadata in the rundir, but
-  # these have lower weight than values from the environment, which in turn have lower weight than
-  # values from command-line arguments.
+  _, subcommand, argv = argv[0], argv[1], argv[2:]
+
+  if subcommand not in subcommands:
+    raise KeyError("unknown subcommand", subcommand)
+
   config = Config()
-  print("from env", config.__dict__)
-  argv = config.parse_args(argv[2:])
-  print("from argv", config.__dict__)
-  if config.label and subcommand in local_subcommands:
-    config = config.with_underrides(Config.from_file(
+  argv = config.parse_args(argv)
+
+  if subcommand in labeltaking_subcommands:
+    if argv:
+      label, argv = argv[0], argv[1:]
+      # whatever the user specifies takes precedence over automatic config propagation arguments
+      config.override(label=label)
+
+  if hasattr(config, "label") and not getattr(config, "on_remote", 0):
+    config.underride(Config.from_file(
       Path(local_runsdir, config.label, "config.json")))
-    print("from config", config.__dict__)
+
   # finally, add defaults
   config.underride(Config.defaults)
 
+  print("config", config.__dict__)
   # NOTE: in future there may be some subcommands that don't require a remote, e.g. list jobs and states
   assert config.remote
   remote = get_remote(config.remote)
@@ -64,8 +70,7 @@ def main(argv):
 class Config(object):
   # in order to be able to invoke ourselves locally and remotely and in ways that must be robust to
   # several levels of string mangling, this object deals with what would otherwise just be flags.
-  keys = "label remote bypass".split()
-  defaults = dict(label=None, remote=None, bypass=0)
+  defaults = dict(label=None, remote=None, bypass=0, on_remote=0)
 
   def __init__(self, items=(), **kwargs):
     self.override(items, **kwargs)
@@ -116,7 +121,7 @@ class Config(object):
       argv = argv[1:]
 
     for key, value in configdict.items():
-      if key not in Config.keys:
+      if key not in Config.defaults:
         raise KeyError("unknown config key", key)
       self.__dict__[key] = value
 
@@ -126,7 +131,7 @@ class Config(object):
     assert not self.bypass # not sure it works currently but don't want to get rid of it
     return (["detour", subcommand] +
             ["%s:%s" % (key, getattr(self, key))
-             for key in Config.keys if hasattr(self, key)])
+             for key in Config.defaults if hasattr(self, key)])
 
 
 def parse_value(s):
@@ -147,6 +152,8 @@ def get_remote(key):
     remotes[klass.__name__] = klass
     return klass
 
+  # NOTE: can't register new subcommands at this point; would have to move these classes into global
+  # scope
   @register_remote
   class local(InteractiveRemote):
     ssh_wrapper = "pshaw local".split()
@@ -164,39 +171,77 @@ def get_remote(key):
     ssh_wrapper = "pshaw cedar".split()
     host = "cedar"
     runsdir = Path("/home/cooijmat/projects/rpp-bengioy/cooijmat/detours")
-    rsync_push_flags = ["--chown=cooijmat:rpp-bengioy"]
-
-    def push(self, config):
-      super().push(config)
-      # NOTE: for cedar must chgroup rpp-bengioy all files created; do it once after push and then
-      # rely on setgid to propagate it to things created by the job.
-      #sp.check_call(self.ssh_wrapper + ["chown", "-R", "cooijmat:rpp-bengioy",
-      #                                  self.rundir(config.label)])
-      #sp.check_call(self.ssh_wrapper + ["find", self.rundir(config.label), "-type", "d",
-      #                                  "-exec", "chmod", "g+s", "{}", ";"])
 
   return remotes[key]()
 
 
-class Remote(object):
-  rsync_push_flags = []
+subcommands = set()
 
+def register_subcommand(fn):
+  subcommands.add(fn.__name__)
+  return fn
+
+# convenience decorators for remote interaction
+def _remotely(fn, synchronized=True):
+  fn = register_subcommand(fn)
+  subcommand = fn.__name__
+  def wfn(remote, config, *argv):
+    if config.on_remote:
+      return fn(remote, config, *argv)
+    else:
+      if synchronized:
+        with remote.synchronization(config):
+          return remote.enter_ssh(config, subcommand, *argv)
+      else:
+        return remote.enter_ssh(config, subcommand, *argv)
+  return wfn
+
+def remotely(fn): return _remotely(fn, synchronized=True)
+def remotely_nosync(fn): return _remotely(fn, synchronized=False)
+
+def locally(fn): return register_subcommand(fn)
+
+# convenience decorator for subcommands that optionally take a label as first argument.
+labeltaking_subcommands = set()
+def labeltaking(fn):
+  subcommand = fn.__name__
+  subcommands.add(subcommand)
+  labeltaking_subcommands.add(subcommand)
+  return fn
+
+
+class Remote(object):
   def rundir(self, label): return Path(self.runsdir, label)
   def ssh_rundir(self, label): return "%s:%s" % (self.host, self.rundir(label))
   ssh_runsdir = property(lambda self: "%s:%s" % (self.host, self.runsdir))
 
+  @locally
+  @labeltaking
   def pull(self, config):
     sp.check_call(self.ssh_wrapper + ["rsync", "-rlvz"] + rsync_filter +
                   ["%s/" % self.ssh_rundir(config.label),
                    "%s/%s" % (local_runsdir, config.label)])
 
+  @locally
+  @labeltaking
   def push(self, config):
-    sp.check_call(self.ssh_wrapper + ["rsync", "-rlvz"] +
-                  self.rsync_push_flags + rsync_filter +
+    sp.check_call(self.ssh_wrapper + ["rsync", "-rlvz"] + rsync_filter +
                   ["%s/%s/" % (local_runsdir, config.label),
                    self.ssh_rundir(config.label)])
 
-  def prepare_launch(self, invocation):
+  @remotely
+  @labeltaking
+  def visit(self, config):
+    sp.check_call("bash", cwd=str(self.rundir(config.label)))
+
+  @remotely_nosync
+  @labeltaking
+  def status(self, config):
+    job_id = Path(self.runsdir, config.label, "job_id").read_text()
+    sp.check_call(["squeue", "-j", job_id])
+
+  @locally
+  def package(self, config, *invocation):
     timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     checksum_output = sp.check_output(
       "|".join([
@@ -209,41 +254,25 @@ class Remote(object):
     # (shortened to 128 bits or 32 hex characters to fit in screen's session name limit)
     checksum = checksum_output.decode().splitlines()[0].split()[0][:32]
     label = "%s_%s" % (timestamp, checksum)
-    logger.warn("invocation: %r", invocation)
-    logger.warn("label: %r", label)
     Path(local_runsdir, label).mkdir(parents=True)
     sp.check_call(["rsync", "-a", "."] + rsync_filter +
                   [Path(local_runsdir, label, "tree")])
     Path(local_runsdir, label, "invocation.json").write_text(json.dumps(invocation))
-    return label
-
-  def launch(self, config, *argv):
-    # NOTE it's a long way from `launch` to `run`:
-    # launch -> enter_ssh -> enter_screen -> enter_job -> enter_conda -> run
-    label = self.prepare_launch(argv)
-    config = config.with_overrides(label=label)
+    config.override(label=label)
     config.to_file(Path(local_runsdir, label, "config.json"))
-    self.push(config)
-    with self.synchronization(config):
-      self.enter_ssh(config)
+    logger.warn("invocation: %r", invocation)
+    logger.warn("label: %r", label)
 
-  # FIXME specialize: LocalRemote has this as a no-op if config.bypass
-  def enter_ssh(self, config):
-    detour_program = os.path.realpath(sys.argv[0])
-    sp.check_call(self.ssh_wrapper + ["scp", detour_program, "%s:bin/detour" % self.host])
-    sp.check_call(self.ssh_wrapper + ["ssh", "-t", self.host] +
-                  config.to_argv("enter_screen"))
-
-  def enter_conda(self, config):
-    env = os.environ
-    env = activate_environment("py36", env)
-    env["DETOUR_LABEL"] = config.label
-    sp.check_call(config.to_argv("run"), env=env)
-
+  @remotely
+  @labeltaking
   def run(self, config):
     status = None
     try:
+      # record job number so we can determine status later, as well as whether it got started at all
+      Path(self.runsdir, config.label, "job_id").write_text(os.environ["SLURM_JOB_ID"])
       invocation = json.loads(Path(self.runsdir, config.label, "invocation.json").read_text())
+      conda_activate("py36")
+      os.environ["DETOUR_LABEL"] = config.label # for the user program
       # TODO: capture stdout/stderr without breaking interactivity
       status = sp.check_call(invocation, cwd=str(Path(self.runsdir, config.label, "tree")))
     finally:
@@ -254,42 +283,71 @@ class Remote(object):
         status = tb.format_exc()
       Path(self.runsdir, config.label, "terminated").write_text(str(status))
 
+  @locally
+  @labeltaking
+  def synchronizing(self, config):
+    while not Path(local_runsdir, config.label, "terminated").exists():
+      interruptible_sleep(30)
+      # TODO: what to do on failure?
+      sp.call(config.to_argv("pull"),
+              stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+
+  def enter_ssh(self, config, subcommand, *argv):
+    detour_program = os.path.realpath(sys.argv[0])
+    sp.check_call(self.ssh_wrapper + ["scp", detour_program, "%s:bin/detour" % self.host])
+    sp.check_call(self.ssh_wrapper + ["ssh", "-t", self.host] +
+                  config.with_overrides(on_remote=1).to_argv(subcommand) + list(argv))
+
+  @contextlib.contextmanager
+  def synchronization(self, config):
+    synchronizer = sp.Popen(config.to_argv("synchronizing"),
+                            stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+    yield
+    synchronizer.terminate()
+    synchronizer.wait()
+    if not Path(local_runsdir, config.label, "terminated").exists():
+      sp.check_call(config.to_argv("pull"))
+
 class BatchRemote(Remote):
-  def enter_screen(self, config):
-    # it would be nice to invoke the sbatch inside a screen just so we have a window we can attach,
-    # but it would get out of hand quickly and how would we clean it up?
-    # TODO: investigate the possibility of waiting for the job
+  @locally
+  def launch(self, config, *argv):
+    self.package(config, *argv)
+    self.push(config)
     self.enter_job(config)
 
+  @remotely_nosync
+  @labeltaking
   def enter_job(self, config):
     rundir = self.rundir(config.label)
     rundir.mkdir(parents=True, exist_ok=True)
 
     # make a script describing the job
-    command = " ".join(config.to_argv("enter_conda"))
+    command = " ".join(config.to_argv("run"))
     Path(rundir, "sbatch.sh").write_text(textwrap.dedent("""
          #!/bin/bash
          #SBATCH --time=01:00:00
          #SBATCH --account=rpp-bengioy
          #SBATCH --gres=gpu:1
          #SBATCH --mem=16G
-         #SBATCH -- are you --interpreting these at all
+         module load cuda/9.0.176 cudnn/7.0
+         export LD_LIBRARY_PATH=$EBROOTCUDA/lib64:$EBROOTCUDNN/lib64:$LD_LIBRARY_PATH
          %s
          """ % command).strip())
 
     sp.check_call(["sbatch", "sbatch.sh"], cwd=str(rundir))
 
-  @contextlib.contextmanager
-  def synchronization(self, config):
-    # make no attempt to synchronize, because sbatch returns immediately
-    yield
+  # just making sure this isn't getting called
+  def enter_screen(self, config): assert False
 
 class InteractiveRemote(Remote):
-  def attach(self, config):
-    with self.synchronization(config):
-      sp.check_call(self.ssh_wrapper + ["ssh", "-t", self.host,
-                                        "screen", "-x", get_screenlabel(config.label)])
+  @locally
+  def launch(self, config, *argv):
+    self.package(config, *argv)
+    self.push(config)
+    self.enter_screen(config)
 
+  @remotely
+  @labeltaking
   def enter_screen(self, config):
     rundir = self.rundir(config.label)
     rundir.mkdir(parents=True, exist_ok=True)
@@ -305,10 +363,11 @@ class InteractiveRemote(Remote):
     sp.check_call(["screen", "-S", screenlabel, "-p", "0", "-X", "stuff",
                    "%s && exit^M" % " ".join(config.to_argv("enter_job"))],
                   cwd=str(rundir))
-    # FIXME specialize: don't attach on cedar
     sp.check_call(["screen", "-x", screenlabel],
                   env=dict(TERM="xterm-color"))
 
+  @remotely
+  @labeltaking
   def enter_job(self, config):
     excluded_hosts = [
       "mila00", # requires nvidia acknowledgement
@@ -319,33 +378,12 @@ class InteractiveRemote(Remote):
     sp.check_call(["sinter", "--gres=gpu", "-Cgpu12gb", "--qos=unkillable", "--mem=16G",
                    "--exclude=%s" % ",".join(excluded_hosts),
                    # bash complains about some ioctl mystery, but it's fine
-                   "bash", "-lic", " ".join(config.to_argv("enter_conda"))])
+                   "bash", "-lic", " ".join(config.to_argv("run"))])
 
-  # FIXME specialize: sync differently on cedar because we don't attach to screen and wait for completion
-  @contextlib.contextmanager
-  def synchronization(self, config):
-    yield
-    return
-    childpid = os.fork()
-    if childpid == 0:
-      while True:
-        interruptible_sleep(30)
-        self.pull(config)
-        #sp.check_call(config.to_argv("pull"),
-        #              stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
-        if Path(local_runsdir, config.label, "terminated").exists():
-          break
-    else:
-      try:
-        yield
-      finally:
-        os.kill(childpid, signal.SIGTERM)
-        os.waitpid(childpid, 0)
-
-    if not Path(local_runsdir, config.label, "terminated").exists():
-      #sp.check_call(config.to_argv("pull"),
-      #              stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
-      pass
+  @remotely
+  @labeltaking
+  def attach(self, config):
+    sp.check_call(["screen", "-x", get_screenlabel(config.label)])
 
 def get_screenlabel(label):
   return "detour_%s" % label
@@ -360,12 +398,12 @@ def udict(*mappings, **more_mappings):
               for key, value in dict(mapping).items())
 
 # -_______________-
-def activate_environment(name, env):
-  env["CONDA_DEFAULT_ENV"] = name
-  env["CONDA_PATH_BACKUP"] = env["PATH"]
-  env["CONDA_PREFIX"] = os.path.join(env["HOME"], ".conda", "envs", name)
-  env["PATH"] = "%s:%s" % (os.path.join(env["CONDA_PREFIX"], "bin"), env["PATH"])
-  return env
+def conda_activate(name):
+  os.environ["CONDA_DEFAULT_ENV"] = name
+  os.environ["CONDA_PATH_BACKUP"] = os.environ["PATH"]
+  os.environ["CONDA_PREFIX"] = os.path.join(os.environ["HOME"], ".conda", "envs", name)
+  os.environ["PATH"] = "%s:%s" % (os.path.join(os.environ["CONDA_PREFIX"], "bin"),
+                                  os.environ["PATH"])
 
 if __name__ == "__main__":
   main(sys.argv)
