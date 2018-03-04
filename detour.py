@@ -11,19 +11,13 @@ logger.setLevel(logging.INFO)
 
 # job dependencies are considered to be everything in the current directory, except
 # hidden files and __pycache__ and notebooks
-# TODO and large files
-find_filter = """
-  -not -path */.* -and
-  -not -path */__pycache__/* -and
-  -not -name *.npz*-numpy.npy -and
-  -not -name *.ipynb
-""".strip().split()
 rsync_filter = """
+  --include .d2filter
   --exclude .*
   --exclude __pycache__
   --exclude *.npz*-numpy.npy
   --exclude *.ipynb
-""".strip().split()
+""".strip().split() + ["--filter=: /.d2filter"]
 
 local_runsdir = ".detours"
 
@@ -209,7 +203,6 @@ def labeltaking(fn):
   labeltaking_subcommands.add(subcommand)
   return fn
 
-
 class Remote(object):
   def rundir(self, label): return Path(self.runsdir, label)
   def ssh_rundir(self, label): return "%s:%s" % (self.host, self.rundir(label))
@@ -243,20 +236,23 @@ class Remote(object):
   @locally
   def package(self, config, *invocation):
     timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+    # gather files and determine checksum
+    path = Path(tempfile.mkdtemp())
+    sp.check_call(self.ssh_wrapper + ["rsync", "-rlzF"] + rsync_filter +
+                  ["./", str(path)])
     checksum_output = sp.check_output(
-      "|".join([
-        # would prefer to use find -print0 and tar --null, but the latter doesn't seem to work
-        "find . -type f '%s'" % "' '".join(find_filter),
-        "tar -cf - --no-recursion --verbatim-files-from --files-from=-",
-        "sha256sum",
-       ]),
+      # (would prefer to use find -print0 and tar --null, but the latter doesn't seem to work)
+      "tar -cf - %s | sha256sum" % path,
       shell=True)
     # (shortened to 128 bits or 32 hex characters to fit in screen's session name limit)
     checksum = checksum_output.decode().splitlines()[0].split()[0][:32]
+
+    # create rundir and move files into place
     label = "%s_%s" % (timestamp, checksum)
     Path(local_runsdir, label).mkdir(parents=True)
-    sp.check_call(["rsync", "-a", "."] + rsync_filter +
-                  [Path(local_runsdir, label, "tree")])
+    shutil.move(path, Path(local_runsdir, label, "tree"))
+
     Path(local_runsdir, label, "invocation.json").write_text(json.dumps(invocation))
     config.override(label=label)
     config.to_file(Path(local_runsdir, label, "config.json"))
