@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-import argparse, datetime, json, logging, os, shutil, signal, sys, tempfile, time, re, pdb, textwrap
+import argparse, datetime, json, logging, os, shutil, signal, sys, tempfile, time, re, pdb, textwrap, glob
 import itertools as it, subprocess as sp, traceback as tb
 import contextlib
 from pathlib import Path
-from collections import OrderedDict as ordict
+from collections import OrderedDict as ordict, defaultdict as ddict
 import collections
 
 logger = logging.Logger("detour")
@@ -31,9 +31,94 @@ def pdb_post_mortem(fn):
       raise
   return wfn
 
+def study_labels(study):
+  for path in sorted(glob.glob(".detours/*/config.json")):
+    config = Config.from_file(path)
+    if getattr(config, "study", None) == study:
+      yield config.label
+
+def dedup(xs):
+  seen = set()
+  ys = []
+  for x in xs:
+    if x not in seen:
+      seen.add(x)
+      ys.append(x)
+  return ys
+
+def extract_exceptions(label):
+  try:
+    stdout_path, = glob.glob(str(Path(local_runsdir, label, "slurm-*.out")))
+  except StopIteration:
+    pass
+
+  re_ansi_escape = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+  re_exception = re.compile(r"^([A-Z][a-z]*)+(Error|Exception)\s*:\s*.*$")
+  exceptions = []
+  with open(stdout_path, "r") as stdout:
+    for line in stdout:
+      line = re_ansi_escape.sub("", line)
+      match = re_exception.match(line)
+      if match:
+        exceptions.append(line.strip())
+  return dedup(exceptions)
+
 @pdb_post_mortem
 def main(argv):
   _, subcommand, argv = argv[0], argv[1], argv[2:]
+
+  # a subcommand that deals with multiple configs... TODO figure out how to organize this mess
+  if subcommand == "pullstudy":
+    study = argv[0]
+    for label in study_labels(study):
+      if not Path(local_runsdir, label, "terminated").exists():
+        sp.check_call(["detour", "pull", label])
+    sys.exit(0)
+  if subcommand == "studystatus":
+    study = argv[0]
+    by_status = ddict(list)
+    for label in study_labels(study):
+      terminated_path = Path(local_runsdir, label, "terminated")
+      if not terminated_path.exists():
+        sp.check_call(["detour", "pull", label])
+      if terminated_path.exists():
+        status = terminated_path.read_text()
+        if "CalledProcessError" in status:
+          # uninformative exception in "detour run" command; extract the true exception from slurm-*.out
+          exceptions = extract_exceptions(label)
+          status = "; ".join(exceptions)
+      else:
+        if sp.check_call(["detour", "status", label]):
+          status = "not running"
+      by_status[status].append(label)
+    for key, value in by_status.items():
+      print(len(value), "runs:", key)
+    sys.exit(0)
+  if subcommand == "pullremote":
+    remote = argv[0]
+    for path in sorted(glob.glob(".detours/*/config.json")):
+      config = Config.from_file(path)
+      if getattr(config, "remote", None) != remote:
+        continue
+      if not Path(Path(path).parent, "terminated").exists():
+        sp.check_call(["detour", "pull", config.label])
+    sys.exit(0)
+  if subcommand == "fix_configs":
+    for path in sorted(glob.glob(".detours/*")):
+      label = Path(path).name
+      assert re.match("^[0-9]{8}_[0-9]{6}_[0-9a-z]{32}$", label)
+      config_path = Path(path, "config.json")
+      if config_path.exists():
+        config = Config.from_file(config_path)
+      else:
+        config = Config()
+      group_path = Path(path, "tree", "group")
+      if group_path.exists():
+        study = group_path.read_text()
+        config.underride(study=study)
+      config.underride(remote="mila", label=label)
+      config.to_file(config_path)
+    sys.exit(0)
 
   if subcommand not in subcommands:
     raise KeyError("unknown subcommand", subcommand)
@@ -56,6 +141,7 @@ def main(argv):
 
   print("config", config.__dict__)
   # NOTE: in future there may be some subcommands that don't require a remote, e.g. list jobs and states
+
   assert config.remote
   remote = get_remote(config.remote)
   getattr(remote, subcommand)(config, *argv)
@@ -64,7 +150,7 @@ def main(argv):
 class Config(object):
   # in order to be able to invoke ourselves locally and remotely and in ways that must be robust to
   # several levels of string mangling, this object deals with what would otherwise just be flags.
-  defaults = dict(label=None, remote=None, bypass=0, on_remote=0)
+  defaults = dict(label=None, study=None, remote=None, bypass=0, on_remote=0)
 
   def __init__(self, items=(), **kwargs):
     self.override(items, **kwargs)
@@ -97,7 +183,7 @@ class Config(object):
 
   @staticmethod
   def from_file(path):
-    return Config(json.loads(path.read_text()))
+    return Config(json.loads(Path(path).read_text()))
 
   def to_file(self, path):
     path.write_text(json.dumps(self.__dict__))
@@ -211,14 +297,14 @@ class Remote(object):
   @locally
   @labeltaking
   def pull(self, config):
-    sp.check_call(self.ssh_wrapper + ["rsync", "-rlvz"] + rsync_filter +
+    sp.check_call(self.ssh_wrapper + ["rsync", "-rltvz"] + rsync_filter +
                   ["%s/" % self.ssh_rundir(config.label),
                    "%s/%s" % (local_runsdir, config.label)])
 
   @locally
   @labeltaking
   def push(self, config):
-    sp.check_call(self.ssh_wrapper + ["rsync", "-rlvz"] + rsync_filter +
+    sp.check_call(self.ssh_wrapper + ["rsync", "-rltvz"] + rsync_filter +
                   ["%s/%s/" % (local_runsdir, config.label),
                    self.ssh_rundir(config.label)])
 
@@ -231,7 +317,16 @@ class Remote(object):
   @labeltaking
   def status(self, config):
     job_id = Path(self.runsdir, config.label, "job_id").read_text()
-    sp.check_call(["squeue", "-j", job_id])
+    result = sp.call(["squeue", "-j", job_id])
+    if result:
+      logger.warn("invalid job %s (job may have terminated)", job_id)
+
+  @locally
+  @labeltaking
+  def purge(self, config):
+    sp.check_call(self.ssh_wrapper + ["ssh", self.host] +
+                  ["rm", "-r", str(Path(self.runsdir, config.label))])
+    sp.check_call(["rm", "-r", str(Path(local_runsdir, config.label))])
 
   @locally
   def package(self, config, *invocation):
@@ -321,7 +416,7 @@ class BatchRemote(Remote):
     command = " ".join(config.to_argv("run"))
     Path(rundir, "sbatch.sh").write_text(textwrap.dedent("""
          #!/bin/bash
-         #SBATCH --time=01:00:00
+         #SBATCH --time=23:59:59
          #SBATCH --account=rpp-bengioy
          #SBATCH --gres=gpu:1
          #SBATCH --mem=16G
