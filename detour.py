@@ -5,6 +5,20 @@ import contextlib
 from pathlib import Path
 from collections import OrderedDict as ordict, defaultdict as ddict
 import collections
+import collections.abc # enough already
+
+if not hasattr(Path, "write_text"):
+  def read_text(self, encoding=None, errors=None):
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+      return f.read()
+  def write_text(self, data, encoding=None, errors=None):
+    if not isinstance(data, str):
+      raise TypeError('data must be str, not %s' % data.__class__.__name__)
+    with self.open(mode='w', encoding=encoding, errors=errors) as f:
+      return f.write(data)
+  Path.read_text = read_text
+  Path.write_text = write_text
+
 
 logger = logging.Logger("detour")
 logger.setLevel(logging.INFO)
@@ -74,6 +88,11 @@ def main(argv):
       if not Path(local_runsdir, label, "terminated").exists():
         sp.check_call(["detour", "pull", label])
     sys.exit(0)
+  if subcommand == "purgestudy":
+    study = argv[0]
+    for label in study_labels(study):
+      sp.check_call(["detour", "purge", label])
+    sys.exit(0)
   if subcommand == "studystatus":
     study = argv[0]
     by_status = ddict(list)
@@ -90,6 +109,8 @@ def main(argv):
       else:
         if sp.check_call(["detour", "status", label]):
           status = "not running"
+        else:
+          status = "dunno"
       by_status[status].append(label)
     for key, value in by_status.items():
       print(len(value), "runs:", key)
@@ -313,13 +334,24 @@ class Remote(object):
   def visit(self, config):
     sp.check_call("bash", cwd=str(self.rundir(config.label)))
 
+  @locally
+  @labeltaking
+  def invocation(self, config):
+    invocation = json.loads(Path(local_runsdir, config.label, "invocation.json").read_text())
+    print(repr(invocation))
+
   @remotely_nosync
   @labeltaking
   def status(self, config):
-    job_id = Path(self.runsdir, config.label, "job_id").read_text()
-    result = sp.call(["squeue", "-j", job_id])
-    if result:
-      logger.warn("invalid job %s (job may have terminated)", job_id)
+    try:
+      job_id = Path(self.runsdir, config.label, "job_id").read_text()
+    except FileNotFoundError:
+      # FIXME we should be able to get job_id at submission time
+      print(config.label, "queued")
+    else:
+      result = sp.call(["squeue", "-j", job_id])
+      if result:
+        logger.warn("invalid job %s (job may have terminated)", job_id)
 
   @locally
   @labeltaking
@@ -359,10 +391,10 @@ class Remote(object):
   def run(self, config):
     status = None
     try:
+      conda_activate("py36")
       # record job number so we can determine status later, as well as whether it got started at all
       Path(self.runsdir, config.label, "job_id").write_text(os.environ["SLURM_JOB_ID"])
       invocation = json.loads(Path(self.runsdir, config.label, "invocation.json").read_text())
-      conda_activate("py36")
       os.environ["DETOUR_LABEL"] = config.label # for the user program
       # TODO: capture stdout/stderr without breaking interactivity
       status = sp.check_call(invocation, cwd=str(Path(self.runsdir, config.label, "tree")))
