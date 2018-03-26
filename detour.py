@@ -357,7 +357,7 @@ class Remote(object):
   @labeltaking
   def purge(self, config):
     sp.check_call(self.ssh_wrapper + ["ssh", self.host] +
-                  ["rm", "-r", str(Path(self.runsdir, config.label))])
+                  ["rm", "-rf", str(Path(self.runsdir, config.label))])
     sp.check_call(["rm", "-r", str(Path(local_runsdir, config.label))])
 
   @locally
