@@ -60,6 +60,11 @@ def dedup(xs):
       ys.append(x)
   return ys
 
+def abridge(s, maxlen=80):
+  if len(s) < maxlen: return s
+  k = (maxlen - 3) // 2
+  return s[:k] + "..." + s[len(s) - k:]
+
 def extract_exceptions(label):
   try:
     stdout_path, = glob.glob(str(Path(local_runsdir, label, "slurm-*.out")))
@@ -67,7 +72,7 @@ def extract_exceptions(label):
     pass
 
   re_ansi_escape = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
-  re_exception = re.compile(r"^([A-Z][a-z]*)+(Error|Exception)\s*:\s*.*$")
+  re_exception = re.compile(r"^([A-Z]?[a-z]*\.?)+(Error|Exception)\s*:\s*.*$")
   exceptions = []
   with open(stdout_path, "r") as stdout:
     for line in stdout:
@@ -75,7 +80,16 @@ def extract_exceptions(label):
       match = re_exception.match(line)
       if match:
         exceptions.append(line.strip())
-  return dedup(exceptions)
+  exceptions = dedup(exceptions)
+  def fn(ex):
+    # attempt to filter out uninteresting exceptions while keeping kills
+    if "CalledProcessError" in ex:
+      if "Signals.SIG" in ex:
+        return True
+      return False
+    return True
+  exceptions = filter(fn, exceptions)
+  return exceptions
 
 @pdb_post_mortem
 def main(argv):
@@ -105,6 +119,7 @@ def main(argv):
         if "CalledProcessError" in status:
           # uninformative exception in "detour run" command; extract the true exception from slurm-*.out
           exceptions = extract_exceptions(label)
+          exceptions = [abridge(ex, 80) for ex in exceptions]
           status = "; ".join(exceptions)
       else:
         if sp.check_call(["detour", "status", label]):
@@ -343,15 +358,21 @@ class Remote(object):
   @remotely_nosync
   @labeltaking
   def status(self, config):
+    def mark_lost():
+      terminated_path = Path(self.runsdir, config.label, "terminated")
+      if not terminated_path.exists():
+        terminated_path.write_text("lost")
     try:
       job_id = Path(self.runsdir, config.label, "job_id").read_text()
     except FileNotFoundError:
-      # FIXME we should be able to get job_id at submission time
-      print(config.label, "queued")
+      print(config.label, "no job_id; marking as lost")
+      mark_lost()
     else:
       result = sp.call(["squeue", "-j", job_id])
       if result:
-        logger.warn("invalid job %s (job may have terminated)", job_id)
+        print("invalid job %s (marking as lost)", job_id)
+        mark_lost()
+        return result
 
   @locally
   @labeltaking
@@ -450,14 +471,22 @@ class BatchRemote(Remote):
          #!/bin/bash
          #SBATCH --time=23:59:59
          #SBATCH --account=rpp-bengioy
-         #SBATCH --gres=gpu:1
          #SBATCH --mem=16G
+         #SBATCH --gres=gpu:1
+         # some jobs need big gpus :-/
+         ##SBATCH --gres=gpu:lgpu:4
          module load cuda/9.0.176 cudnn/7.0
          export LD_LIBRARY_PATH=$EBROOTCUDA/lib64:$EBROOTCUDNN/lib64:$LD_LIBRARY_PATH
+         echo $HOSTNAME
+         nvidia-smi
          %s
          """ % command).strip())
 
-    sp.check_call(["sbatch", "sbatch.sh"], cwd=str(rundir))
+    output = sp.check_output(["sbatch", "sbatch.sh"], cwd=str(rundir))
+    match = re.match(rb"\s*Submitted\s*batch\s*job\s*(?P<id>[0-9]+)\s*", output)
+    if not match:
+      print(output)
+    Path(rundir, "job_id").write_bytes(match.group("id"))
 
   # just making sure this isn't getting called
   def enter_screen(self, config): assert False
