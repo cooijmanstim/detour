@@ -166,22 +166,6 @@ def main(argv):
       if not Path(Path(path).parent, "terminated").exists():
         sp.check_call(["detour", "pull", config.label])
     sys.exit(0)
-  if subcommand == "fix_configs":
-    for path in sorted(glob.glob(".detours/*")):
-      label = Path(path).name
-      assert re.match("^[0-9]{8}_[0-9]{6}_[0-9a-z]{32}$", label)
-      config_path = Path(path, "config.json")
-      if config_path.exists():
-        config = Config.from_file(config_path)
-      else:
-        config = Config()
-      group_path = Path(path, "tree", "group")
-      if group_path.exists():
-        study = group_path.read_text()
-        config.underride(study=study)
-      config.underride(remote="mila", label=label)
-      config.to_file(config_path)
-    sys.exit(0)
   # FIXME implement resubmit_sticklers to resubmit jobs that never started and aren't in the slurm queue (i.e. if not terminated, take job_id, check queue, resubmit)
 
   if subcommand not in subcommands:
