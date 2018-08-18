@@ -35,6 +35,11 @@ rsync_filter = """
 
 local_runsdir = ".detours"
 
+
+def make_that_dir(path):
+  path = str(path) # convert pathlib Path (which has mkdir but exist_ok is py>=3.5)
+  os.makedirs(path, exist_ok=True)
+
 def pdb_post_mortem(fn):
   def wfn(*args, **kwargs):
     try:
@@ -65,14 +70,22 @@ def abridge(s, maxlen=80):
   k = (maxlen - 3) // 2
   return s[:k] + "..." + s[len(s) - k:]
 
+def get_stdout_file(rundir):
+  for pattern in "session.script slurm-*.out".split():
+    expression = str(Path(rundir, pattern))
+    paths = glob.glob(expression)
+    if paths:
+      path, = paths
+      return path
+  return None
+
 def extract_exceptions(label):
-  try:
-    stdout_path, = glob.glob(str(Path(local_runsdir, label, "slurm-*.out")))
-  except StopIteration:
-    pass
+  stdout_path = get_stdout_file(Path(local_runsdir, label))
+  if not stdout_path:
+    logger.warn("no stdout found for %s", label)
 
   re_ansi_escape = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
-  re_exception = re.compile(r"^([A-Z]?[a-z]*\.?)+(Error|Exception)\s*:\s*.*$")
+  re_exception = re.compile(r"^[A-Za-z_.]+(Error|Exception)\s*:\s*.*$")
   exceptions = []
   with open(stdout_path, "r") as stdout:
     for line in stdout:
@@ -91,6 +104,15 @@ def extract_exceptions(label):
   exceptions = filter(fn, exceptions)
   return exceptions
 
+def purgemany(labels):
+  configs_by_remote = ddict(list)
+  for label in labels:
+    config = Config.from_label(label)
+    configs_by_remote[config.remote].append(config)
+  for remote, configs in configs_by_remote.items():
+    remote = get_remote(remote)
+    remote.purgemany(configs)
+
 @pdb_post_mortem
 def main(argv):
   _, subcommand, argv = argv[0], argv[1], argv[2:]
@@ -104,8 +126,10 @@ def main(argv):
     sys.exit(0)
   if subcommand == "purgestudy":
     study = argv[0]
-    for label in study_labels(study):
-      sp.check_call(["detour", "purge", label])
+    purgemany(study_labels(study))
+    sys.exit(0)
+  if subcommand == "purgemany":
+    purgemany(argv)
     sys.exit(0)
   if subcommand == "studystatus":
     study = argv[0]
@@ -129,6 +153,9 @@ def main(argv):
       by_status[status].append(label)
     for key, value in by_status.items():
       print(len(value), "runs:", key)
+      if len(argv) > 1 and "--verbose" in argv:
+        for label in value:
+          print("  ", label)
     sys.exit(0)
   if subcommand == "pullremote":
     remote = argv[0]
@@ -155,6 +182,7 @@ def main(argv):
       config.underride(remote="mila", label=label)
       config.to_file(config_path)
     sys.exit(0)
+  # FIXME implement resubmit_sticklers to resubmit jobs that never started and aren't in the slurm queue (i.e. if not terminated, take job_id, check queue, resubmit)
 
   if subcommand not in subcommands:
     raise KeyError("unknown subcommand", subcommand)
@@ -220,6 +248,10 @@ class Config(object):
   @staticmethod
   def from_file(path):
     return Config(json.loads(Path(path).read_text()))
+
+  @staticmethod
+  def from_label(label):
+    return Config.from_file(Path(".detours", label, "config.json"))
 
   def to_file(self, path):
     path.write_text(json.dumps(self.__dict__))
@@ -333,7 +365,7 @@ class Remote(object):
   @locally
   @labeltaking
   def pull(self, config):
-    sp.check_call(self.ssh_wrapper + ["rsync", "-rltvz"] + rsync_filter +
+    sp.check_call(self.ssh_wrapper + ["rsync", "-rltvz", "--ignore-missing-args"] + rsync_filter +
                   ["%s/" % self.ssh_rundir(config.label),
                    "%s/%s" % (local_runsdir, config.label)])
 
@@ -348,6 +380,14 @@ class Remote(object):
   @labeltaking
   def visit(self, config):
     sp.check_call("bash", cwd=str(self.rundir(config.label)))
+
+  @locally
+  @labeltaking
+  def stdout(self, config):
+    path = get_stdout_file(Path(local_runsdir, config.label))
+    if not path:
+      raise ValueError("no stdout found for %s", config.label)
+    sp.check_call(["less", "+G", path])
 
   @locally
   @labeltaking
@@ -377,9 +417,22 @@ class Remote(object):
   @locally
   @labeltaking
   def purge(self, config):
+    self.purgemany([config])
+    return
     sp.check_call(self.ssh_wrapper + ["ssh", self.host] +
                   ["rm", "-rf", str(Path(self.runsdir, config.label))])
     sp.check_call(["rm", "-r", str(Path(local_runsdir, config.label))])
+
+  @locally
+  def purgemany(self, configs):
+    print([config.label for config in configs])
+    sp.check_call(self.ssh_wrapper + ["ssh", self.host] +
+                  ["rm", "-rf"] +
+                  [str(Path(self.runsdir, config.label))
+                   for config in configs])
+    sp.check_call(["rm", "-r"] +
+                  [str(Path(local_runsdir, config.label))
+                   for config in configs])
 
   @locally
   def package(self, config, *invocation):
@@ -398,7 +451,7 @@ class Remote(object):
 
     # create rundir and move files into place
     label = "%s_%s" % (timestamp, checksum)
-    Path(local_runsdir, label).mkdir(parents=True)
+    make_that_dir(Path(local_runsdir, label))
     shutil.move(path, Path(local_runsdir, label, "tree"))
 
     Path(local_runsdir, label, "invocation.json").write_text(json.dumps(invocation))
@@ -455,7 +508,10 @@ class Remote(object):
 class BatchRemote(Remote):
   @locally
   def launch(self, config, *argv):
-    self.package(config, *argv)
+    try:
+      self.package(config, *argv)
+    except KeyboardInterrupt:
+      self.purge(config)
     self.push(config)
     self.enter_job(config)
 
@@ -463,7 +519,7 @@ class BatchRemote(Remote):
   @labeltaking
   def enter_job(self, config):
     rundir = self.rundir(config.label)
-    rundir.mkdir(parents=True, exist_ok=True)
+    make_that_dir(rundir)
 
     # make a script describing the job
     command = " ".join(config.to_argv("run"))
@@ -502,10 +558,13 @@ class InteractiveRemote(Remote):
   @labeltaking
   def enter_screen(self, config):
     rundir = self.rundir(config.label)
-    rundir.mkdir(parents=True, exist_ok=True)
+    make_that_dir(rundir)
 
     screenlabel = get_screenlabel(config.label)
     sp.check_call(["pkscreen", "-S", screenlabel], cwd=str(rundir))
+    # wrap in `script` to capture output
+    sp.check_call(["screen", "-S", screenlabel, "-p", "0", "-X", "stuff",
+                   "script -e session.script && exit^M"], cwd=str(rundir))
     # `stuff` sends the given string to stdin, i.e. we run the command as if the user had typed
     # it.  the benefit is that we can attach and we are in a bash prompt with exactly the same
     # environment as the program ran in (as opposed to would be the case with some other ways of
@@ -524,8 +583,6 @@ class InteractiveRemote(Remote):
     excluded_hosts = [
       "mila00", # requires nvidia acknowledgement
       "mila01", # requires nvidia acknowledgement
-      "bart13", # borken for good?
-      "bart14",
     ]
     sp.check_call(["sinter", "--gres=gpu", "-Cgpu12gb", "--qos=unkillable", "--mem=16G",
                    "--exclude=%s" % ",".join(excluded_hosts),
