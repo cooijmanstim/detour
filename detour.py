@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import argparse, datetime, json, logging, os, shutil, signal, sys, tempfile, time, re, pdb, textwrap, glob
-import itertools as it, subprocess as sp, traceback as tb
+import itertools as it, subprocess as sp, traceback as tb, functools as ft
 import contextlib
 from pathlib import Path
 from collections import OrderedDict as ordict, defaultdict as ddict
+import base64
 import collections
-import collections.abc # enough already
 
 if not hasattr(Path, "write_text"):
   def read_text(self, encoding=None, errors=None):
@@ -33,248 +33,329 @@ rsync_filter = """
   --exclude *.ipynb
 """.strip().split() + ["--filter=: /.d2filter"]
 
-local_runsdir = ".detours"
+class Database(object):
+  def __init__(self, runsdir):
+    self.runsdir = runsdir
 
+  def get_rundir(self, label):
+    return Path(self.runsdir, label)
 
-def make_that_dir(path):
-  path = str(path) # convert pathlib Path (which has mkdir but exist_ok is py>=3.5)
-  os.makedirs(path, exist_ok=True)
+  def ensure_rundir(self, label):
+    rundir = self.get_rundir(label)
+    make_that_dir(rundir)
+    return rundir
 
-def pdb_post_mortem(fn):
-  def wfn(*args, **kwargs):
+  def set_invocation(self, label, invocation):
+    self.get_invocation_path(label).write_text(json.dumps(invocation))
+
+  def get_invocation(self, label):
+    return json.loads(self.get_invocation_path(label).read_text())
+
+  def get_invocation_path(self, label):
+    return Path(self.runsdir, label, "invocation.json")
+
+  def set_config(self, label, config):
+    self.get_config_path(label).write_text(json.dumps(config))
+
+  def get_config(self, label):
+    return json.loads(self.get_config_path(label).read_text())
+
+  def get_config_path(self, label):
+    return Path(self.runsdir, label, "config.json")
+
+  def get_remote_key(self, label):
+    return self.get_config(label)["remote"]
+
+  def get_remote(self, label):
+    return get_remote(self.get_remote_key(label))
+
+  def known_terminated(self, label):
+    return self.get_terminated_path(label).exists()
+
+  def get_terminated_path(self, label):
+    return Path(self.runsdir, label, "terminated")
+
+  def mark_terminated(self, label, context):
+    terminated_path = self.get_terminated_path(label)
+    assert not terminated_path.exists()
+    terminated_path.touch()
+    terminated_path.write_text(context)
+
+  def mark_lost(self, label):
+    self.mark_terminated(label, "lost")
+
+  def package(self, *invocation, **config):
     try:
-      return fn(*args, **kwargs)
-    except:
+      timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+      # gather files and determine checksum
+      path = Path(tempfile.mkdtemp())
+      sp.check_call(["rsync", "-rlzF"] + rsync_filter + ["./", str(path)])
+      checksum_output = sp.check_output(
+        # (would prefer to use find -print0 and tar --null, but the latter doesn't seem to work)
+        "tar -cf - %s | sha256sum" % path,
+        shell=True)
+      # (shortened to 128 bits or 32 hex characters to fit in screen's session name limit)
+      checksum = checksum_output.decode().splitlines()[0].split()[0][:32]
+
+      label = "%s_%s" % (timestamp, checksum)
+      config["label"] = label
+
+      # create rundir and move files into place
+      shutil.move(path, Path(self.ensure_rundir(label), "tree"))
+
+      self.set_invocation(label, invocation)
+      self.set_config(label, config)
+
+      logger.warning("invocation: %r", invocation)
+      logger.warning("label: %r", label)
+      logger.warning("config: %r", config)
+
+      return label
+    except KeyboardInterrupt:
+      assert False # FIXME remove packagage wherever it is
+      raise
+
+  def study_labels(self, study):
+    for path in sorted(glob.glob(self.runsdir + "/*/config.json")):
+      config = json.loads(Path(path).read_text())
+      if config.get("study", None) == study:
+        yield config["label"]
+
+  def get_screenlabel(self, label):
+    return "detour_%s" % label
+
+  def get_stdout_file(self, label):
+    for pattern in "session.script slurm-*.out".split():
+      expression = str(Path(self.runsdir, label, pattern))
+      paths = glob.glob(expression)
+      if paths:
+        path, = paths
+        return path
+    return None
+
+  def get_status(self, label):
+    try:
+      status = self.get_terminated_path(label).read_text()
+    except FileNotFoundError:
+      status = "unterminated"
+    if "CalledProcessError" in status:
+      # uninformative exception in "detour run" command; extract the true exception from slurm-*.out
+      exceptions = self.extract_exceptions(label)
+      exceptions = [abridge(ex, 80) for ex in exceptions]
+      status = "; ".join(exceptions)
+    return status
+
+  def extract_exceptions(self, label):
+    stdout_path = self.get_stdout_file(label)
+    if not stdout_path:
+      logger.warning("no stdout found for %s", label)
+      return []
+
+    re_ansi_escape = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+    re_exception = re.compile(r"^[A-Za-z_.]+(Error|Exception)\s*:\s*.*$")
+    exceptions = []
+    with open(stdout_path, "r") as stdout:
+      for line in stdout:
+        line = re_ansi_escape.sub("", line)
+        match = re_exception.match(line)
+        if match:
+          exceptions.append(line.strip())
+    exceptions = dedup(exceptions)
+    def fn(ex):
+      # attempt to filter out uninteresting exceptions while keeping kills
+      if "CalledProcessError" in ex:
+        if "Signals.SIG" in ex:
+          return True
+        return False
+      return True
+    exceptions = filter(fn, exceptions)
+    return exceptions
+
+  def get_job_id(self, label):
+    try:
+      return Path(self.runsdir, label, "job_id").read_text()
+    except FileNotFoundError:
+      return None
+
+  def set_job_id(self, label, job_id):
+    Path(self.runsdir, label, "job_id").write_text(job_id)
+
+def serialize(x): return base64.urlsafe_b64encode(json.dumps(x).encode("utf-8")).decode("utf-8")
+def deserialize(x): return json.loads(base64.urlsafe_b64decode(x).decode("utf-8"))
+
+def rpc_encode_argv(*argv, identifier=None):
+  rpc_argv = [serialize(argv)]
+  if identifier is not None:
+    rpc_argv.append(identifier)
+  return rpc_argv
+
+def rpc_decode_argv(arg, identifier=None):
+  return deserialize(arg), dict(identifier=identifier)
+
+def detour_rpc_argv(method, *argv, **kwargs):
+  identifier = kwargs.pop("identifier", None)
+  rpc_argv = rpc_encode_argv(*argv, identifier=identifier)
+  return detour_argv("rpc", method, *rpc_argv, **kwargs)
+
+def detour_argv(*argv, **config):
+  the_config = dict()
+  the_config.update(global_config)
+  the_config.update(config)
+  flags = []
+  for key, value in the_config.items():
+    if isinstance(value, bool): # sigh
+      if value:
+        flags.append("--%s" % key)
+    else:
+      flags.append("--%s=%s" % (key, value))
+  return ["detour"] + flags + ["--"] + list(argv)
+
+def detour_parse_argv(*argv):
+  import argparse
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--on_remote", choices="local mila cedar".split())
+  parser.add_argument("--verbose", default=False, action="store_true")
+  parser.add_argument("subcommand")
+  parser.add_argument("argv", nargs=argparse.REMAINDER)
+  args = parser.parse_args(argv)
+  config = dict(on_remote=args.on_remote,
+                verbose=args.verbose)
+  return config, args.subcommand, args.argv
+
+class Subcommands(dict):
+  def register(self, key, fn):
+    self[key] = fn
+
+  def invoke(self, key, *argv, **kwargs):
+    return self[key](*argv, **kwargs)
+
+global_config = dict()
+localdb = Database(".detours")
+subcommands = Subcommands()
+
+def subcommand(fn):
+  subcommands.register(fn.__name__, fn)
+
+class Main(object):
+  def __call__(self, argv):
+    try:
+      config, subcommand, argv = detour_parse_argv(*argv)
+      global_config.update(config)
+      subcommands.invoke(subcommand, *argv)
+    except Exception: # TODO was "except:"; trying to let keyboardinterrupt pass through
       tb.print_exc()
       pdb.post_mortem()
       raise
-  return wfn
 
-def study_labels(study):
-  for path in sorted(glob.glob(".detours/*/config.json")):
-    config = Config.from_file(path)
-    if getattr(config, "study", None) == study:
-      yield config.label
+  @subcommand
+  def rpc(method, *rpc_argv):
+    assert global_config["on_remote"]
+    remote = global_config["on_remote"]
+    args, kwargs = rpc_decode_argv(*rpc_argv)
+    getattr(get_remote(remote), method)(*args, **kwargs)
 
-def dedup(xs):
-  seen = set()
-  ys = []
-  for x in xs:
-    if x not in seen:
-      seen.add(x)
-      ys.append(x)
-  return ys
+  @subcommand
+  def wtfrpc(method, *rpc_argv):
+    # decode and print an rpc argv
+    print(method, rpc_decode_argv(*rpc_argv))
 
-def abridge(s, maxlen=80):
-  if len(s) < maxlen: return s
-  k = (maxlen - 3) // 2
-  return s[:k] + "..." + s[len(s) - k:]
+  @subcommand
+  def launchcmd(*argv):
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--remote", choices="local mila cedar".split())
+    parser.add_argument("--study")
+    parser.add_argument("invocation", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    label = localdb.package(*args.invocation, study=args.study, remote=args.remote)
+    remote = localdb.get_remote(label)
+    remote.launch([label])
 
-def get_stdout_file(rundir):
-  for pattern in "session.script slurm-*.out".split():
-    expression = str(Path(rundir, pattern))
-    paths = glob.glob(expression)
-    if paths:
-      path, = paths
-      return path
-  return None
+  @subcommand
+  def launch(*labels):
+    for remote, labels in groupby(labels, localdb.get_remote).items():
+      remote.launch(labels)
 
-def extract_exceptions(label):
-  stdout_path = get_stdout_file(Path(local_runsdir, label))
-  if not stdout_path:
-    logger.warn("no stdout found for %s", label)
+  @subcommand
+  def package(*argv):
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--remote", choices="local mila cedar".split())
+    parser.add_argument("--study")
+    parser.add_argument("invocation", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    label = localdb.package(*args.invocation, study=args.study, remote=args.remote)
+    print(label)
 
-  re_ansi_escape = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
-  re_exception = re.compile(r"^[A-Za-z_.]+(Error|Exception)\s*:\s*.*$")
-  exceptions = []
-  with open(stdout_path, "r") as stdout:
-    for line in stdout:
-      line = re_ansi_escape.sub("", line)
-      match = re_exception.match(line)
-      if match:
-        exceptions.append(line.strip())
-  exceptions = dedup(exceptions)
-  def fn(ex):
-    # attempt to filter out uninteresting exceptions while keeping kills
-    if "CalledProcessError" in ex:
-      if "Signals.SIG" in ex:
-        return True
-      return False
-    return True
-  exceptions = filter(fn, exceptions)
-  return exceptions
+  @subcommand
+  def pullstudy(study):
+    labels = list(localdb.study_labels(study))
+    for remote, labels in groupby(labels, localdb.get_remote).items():
+      remote.pull(labels)
 
-def purgemany(labels):
-  configs_by_remote = ddict(list)
-  for label in labels:
-    config = Config.from_label(label)
-    configs_by_remote[config.remote].append(config)
-  for remote, configs in configs_by_remote.items():
-    remote = get_remote(remote)
-    remote.purgemany(configs)
+  @subcommand
+  def push(*labels):
+    for remote, labels in groupby(labels, localdb.get_remote).items():
+      remote.push(labels)
 
-@pdb_post_mortem
-def main(argv):
-  _, subcommand, argv = argv[0], argv[1], argv[2:]
+  @subcommand
+  def pull(*labels):
+    for remote, labels in groupby(labels, localdb.get_remote).items():
+      remote.pull(labels)
 
-  # a subcommand that deals with multiple configs... TODO figure out how to organize this mess
-  if subcommand == "pullstudy":
-    study = argv[0]
-    for label in study_labels(study):
-      if not Path(local_runsdir, label, "terminated").exists():
-        sp.check_call(["detour", "pull", label])
-    sys.exit(0)
-  if subcommand == "purgestudy":
-    study = argv[0]
-    purgemany(study_labels(study))
-    sys.exit(0)
-  if subcommand == "purgemany":
-    purgemany(argv)
-    sys.exit(0)
-  if subcommand == "studystatus":
-    study = argv[0]
-    by_status = ddict(list)
-    for label in study_labels(study):
-      terminated_path = Path(local_runsdir, label, "terminated")
-      if not terminated_path.exists():
-        sp.check_call(["detour", "pull", label])
-      if terminated_path.exists():
-        status = terminated_path.read_text()
-        if "CalledProcessError" in status:
-          # uninformative exception in "detour run" command; extract the true exception from slurm-*.out
-          exceptions = extract_exceptions(label)
-          exceptions = [abridge(ex, 80) for ex in exceptions]
-          status = "; ".join(exceptions)
-      else:
-        if sp.check_call(["detour", "status", label]):
-          status = "not running"
-        else:
-          status = "dunno"
-      by_status[status].append(label)
-    for key, value in by_status.items():
-      print(len(value), "runs:", key)
-      if len(argv) > 1 and "--verbose" in argv:
-        for label in value:
+  @subcommand
+  def purge(*labels):
+    for remote, labels in groupby(labels, localdb.get_remote).items():
+      remote.purge(labels)
+
+  @subcommand
+  def purgestudy(study):
+    labels = list(localdb.study_labels(study))
+    for remote, labels in groupby(labels, localdb.get_remote).items():
+      remote.purge(labels)
+
+  @subcommand
+  def studystatus(study):
+    labels = list(localdb.study_labels(study))
+    statuses = get_statuses(labels)
+    for status, labels in groupby(labels, lambda label: statuses[label]).items():
+      print(len(labels), "runs:", status)
+      if global_config.get("verbose", False):
+        for label in labels:
           print("  ", label)
-    sys.exit(0)
-  if subcommand == "pullremote":
-    remote = argv[0]
-    for path in sorted(glob.glob(".detours/*/config.json")):
-      config = Config.from_file(path)
-      if getattr(config, "remote", None) != remote:
-        continue
-      if not Path(Path(path).parent, "terminated").exists():
-        sp.check_call(["detour", "pull", config.label])
-    sys.exit(0)
-  # FIXME implement resubmit_sticklers to resubmit jobs that never started and aren't in the slurm queue (i.e. if not terminated, take job_id, check queue, resubmit)
 
-  if subcommand not in subcommands:
-    raise KeyError("unknown subcommand", subcommand)
+  @subcommand
+  def stdout(label):
+    path = localdb.get_stdout_file(label)
+    if not path:
+      raise ValueError("no stdout found for %s", label)
+    sp.check_call(["less", "+G", path])
 
-  config = Config()
-  argv = config.parse_args(argv)
+  @subcommand
+  def visit(label): localdb.get_remote(label).visit(label)
+  @subcommand
+  def status(label): localdb.get_remote(label).status(label)
+  @subcommand
+  def attach(label): localdb.get_remote(label).attach(label)
 
-  if subcommand in labeltaking_subcommands:
-    if argv:
-      label, argv = argv[0], argv[1:]
-      # whatever the user specifies takes precedence over automatic config propagation arguments
-      config.override(label=label)
-
-  if hasattr(config, "label") and not getattr(config, "on_remote", 0):
-    config.underride(Config.from_file(
-      Path(local_runsdir, config.label, "config.json")))
-
-  # finally, add defaults
-  config.underride(Config.defaults)
-
-  print("config", config.__dict__)
-  # NOTE: in future there may be some subcommands that don't require a remote, e.g. list jobs and states
-
-  assert config.remote
-  remote = get_remote(config.remote)
-  getattr(remote, subcommand)(config, *argv)
-
-
-class Config(object):
-  # in order to be able to invoke ourselves locally and remotely and in ways that must be robust to
-  # several levels of string mangling, this object deals with what would otherwise just be flags.
-  defaults = dict(label=None, study=None, remote=None, bypass=0, on_remote=0)
-
-  def __init__(self, items=(), **kwargs):
-    self.override(items, **kwargs)
-
-  def override(self, items=(), **kwargs):
-    if isinstance(items, Config):
-      items = items.__dict__
-    self.__dict__.update(items)
-    self.__dict__.update(kwargs)
-
-  def underride(self, items=(), **kwargs):
-    if isinstance(items, Config):
-      items = items.__dict__
-    if isinstance(items, collections.abc.Mapping):
-      items = items.items()
-    for key, value in it.chain(kwargs.items(), items):
-      self.__dict__.setdefault(key, value)
-
-  def with_overrides(self, items=(), **kwargs):
-    # `kwargs` overrides `items` overrides `self`
-    config = Config(self)
-    config.override(items, **kwargs)
-    return config
-
-  def with_underrides(self, items=(), **kwargs):
-    # `self` overrides `kwargs` overrides `items`
-    config = Config(self)
-    config.underride(items, **kwargs)
-    return config
-
-  @staticmethod
-  def from_file(path):
-    return Config(json.loads(Path(path).read_text()))
-
-  @staticmethod
-  def from_label(label):
-    return Config.from_file(Path(".detours", label, "config.json"))
-
-  def to_file(self, path):
-    path.write_text(json.dumps(self.__dict__))
-
-  def parse_args(self, argv):
-    # arg format: (key:value )* (::)? argv
-    configdict = ordict()
-
-    while argv and ":" in argv[0] and argv[0] != "::":
-      arg, argv = argv[0], argv[1:]
-      key, value = arg.split(":")
-      configdict[key] = parse_value(value)
-
-    if argv and argv[0] == "::":
-      argv = argv[1:]
-
-    for key, value in configdict.items():
-      if key not in Config.defaults:
-        raise KeyError("unknown config key", key)
-      self.__dict__[key] = value
-
-    return argv
-
-  def to_argv(self, subcommand):
-    assert not self.bypass # not sure it works currently but don't want to get rid of it
-    return (["detour", subcommand] +
-            ["%s:%s" % (key, getattr(self, key))
-             for key in Config.defaults if hasattr(self, key)])
-
-
-def parse_value(s):
-  s = s.strip()
-  try:
-    return int(s)
-  except ValueError:
-    try:
-      return float(s)
-    except ValueError:
-      return s
+def get_statuses(labels):
+  all_labels = labels
+  statuses = ddict()
+  for remote, labels in groupby(labels, localdb.get_remote_key).items():
+    print(remote, labels)
+    remote = get_remote(remote)
+    unterminated = [label for label in labels if not localdb.known_terminated(label)]
+    remote.pull(unterminated)
+    # for unterminated, figure out statuses remotely
+    unterminated = [label for label in labels if not localdb.known_terminated(label)]
+    if unterminated:
+      statuses.update(remote.statusmany(unterminated))
+    # for terminated, figure out statuses locally
+    terminated = [label for label in labels if localdb.known_terminated(label)]
+    statuses.update((label, localdb.get_status(label)) for label in terminated)
+  assert set(statuses.keys()) == set(all_labels)
+  return statuses
 
 
 def get_remote(key):
@@ -288,18 +369,21 @@ def get_remote(key):
   # scope
   @register_remote
   class local(InteractiveRemote):
+    key = "local"
     ssh_wrapper = "pshaw local".split()
     host = "localhost"
     runsdir = Path("/home/tim/detours")
 
   @register_remote
   class mila(InteractiveRemote):
+    key = "mila"
     ssh_wrapper = "pshaw mila".split()
     host = "elisa3"
     runsdir = Path("/data/milatmp1/cooijmat/detours")
 
   @register_remote
   class cedar(BatchRemote):
+    key = "cedar"
     ssh_wrapper = "pshaw cedar".split()
     host = "cedar"
     runsdir = Path("/home/cooijmat/projects/rpp-bengioy/cooijmat/detours")
@@ -307,244 +391,306 @@ def get_remote(key):
   return remotes[key]()
 
 
-subcommands = set()
+# helper to reduce the brain damage
+def decorator_with_args(decorator):
+  def uno(*args, **kwargs):
+    def dos(function):
+      return decorator(function, *args, **kwargs)
+    return dos
+  return uno
 
-def register_subcommand(fn):
-  subcommands.add(fn.__name__)
-  return fn
+class RemoteCommand(object):
+  def __init__(self, interactive=False):
+    self.interactive = interactive
 
-# convenience decorators for remote interaction
-def _remotely(fn, synchronized=True):
-  fn = register_subcommand(fn)
-  subcommand = fn.__name__
-  def wfn(remote, config, *argv):
-    if config.on_remote:
-      return fn(remote, config, *argv)
+  # note the local part is used as a contextmanager; it wraps around the remote part.
+  # it should contain `result = yield args` where args are the arguments to the
+  # remote subcommand, and the result is the result returned by the remote part.
+  # note the result goes through serialize/deserialize so is constrained to what json
+  # can express. finally, the local part should yield its return value.
+  def locally(self, fn, name=None):
+    self.local_fn = fn
+    self.subcommand = fn.__name__ if name is None else name
+    return self
+
+  def remotely(self, fn, name=None):
+    self.remote_fn = fn
+    self.subcommand = fn.__name__ if name is None else name
+    return self
+
+  def _call_while_local(self, remote, *args, **kwargs):
+    local_fn_invocation = self.local_fn(remote, *args, **kwargs)
+    argv = next(local_fn_invocation)
+    result = self.roundtrip(remote, self.subcommand, *argv)
+    return local_fn_invocation.send(result)
+
+  def __call__(self, remote, *args, **kwargs):
+    if global_config["on_remote"]:
+      self._call_while_remote(remote, *args, **kwargs)
     else:
-      if synchronized:
-        with remote.synchronization(config):
-          return remote.enter_ssh(config, subcommand, *argv)
-      else:
-        return remote.enter_ssh(config, subcommand, *argv)
-  return wfn
+      self._call_while_local(remote, *args, **kwargs)
 
-def remotely(fn): return _remotely(fn, synchronized=True)
-def remotely_nosync(fn): return _remotely(fn, synchronized=False)
+  # total mindfuck courtesy of https://stackoverflow.com/a/47433786/7601527.
+  # callable objects can't decorate methods. python strikes again!
+  def __get__(self, the_self, type=None):
+    return ft.partial(self, the_self)
 
-def locally(fn): return register_subcommand(fn)
+  @staticmethod
+  def from_interactive(interactive, *args, **kwargs):
+    if interactive: return InteractiveRemoteCommand(*args, **kwargs)
+    else: return NoninteractiveRemoteCommand(*args, **kwargs)
 
-# convenience decorator for subcommands that optionally take a label as first argument.
-labeltaking_subcommands = set()
-def labeltaking(fn):
-  subcommand = fn.__name__
-  subcommands.add(subcommand)
-  labeltaking_subcommands.add(subcommand)
-  return fn
+class InteractiveRemoteCommand(RemoteCommand):
+  def _call_while_remote(self, remote, *args, **kwargs):
+    self.remote_fn(remote, *args, **kwargs)
+
+  def roundtrip(self, remote, method, *argv):
+    detour_bin_path = os.path.realpath(sys.argv[0])
+    # TODO: can avoid this if we make a local copy each time we copy to remote. then we can check against local copy
+    sp.check_call(remote.ssh_wrapper + ["scp", detour_bin_path, "%s:bin/detour" % remote.host])
+    return sp.check_call(remote.ssh_wrapper + ["ssh", "-t", remote.host] +
+                         detour_rpc_argv(method, *argv, on_remote=remote.key))
+
+class NoninteractiveRemoteCommand(RemoteCommand):
+  # non-interactive effectively means the command has a structured return
+  # value. this case is painful because there are only two channels through
+  # which the remote command can communicate back to us: the return code and
+  # the output. we serialize the structured return value and dump it in the
+  # output, labeled with an identifier.
+  def _call_while_remote(self, remote, *args, **kwargs):
+    identifier = kwargs.pop("identifier")
+    result = self.remote_fn(remote, *args, **kwargs)
+    print("rpc-response", identifier, serialize(result))
+
+  def roundtrip(self, remote, method, *argv):
+    detour_bin_path = os.path.realpath(sys.argv[0])
+    # TODO: can avoid this if we make a local copy each time we copy to remote. then we can check against local copy
+    sp.check_call(remote.ssh_wrapper + ["scp", detour_bin_path, "%s:bin/detour" % remote.host])
+    # try to maintain interactivity so we can drop into pdb in the remote code.
+    # if all goes well (i.e. no exceptions) there will be no interaction and the
+    # (serialized) return value of the remote code will be in the output,
+    # labeled with the rpc identifier. a better way to do this would be
+    # to capture only stdout and not stderr, but that is just not possible:
+    # https://stackoverflow.com/questions/34186035/can-you-fool-isatty-and-log-stdout-and-stderr-separately
+    import random
+    identifier = serialize(random.random())
+    command = (remote.ssh_wrapper + ["ssh", "-t", remote.host] +
+               detour_rpc_argv(method, *argv, on_remote=remote.key, identifier=identifier))
+    output = check_output_interactive(command)
+    for line in output.splitlines():
+      if line.startswith("rpc-response"):
+        parts = line.split()
+        if parts[0] == "rpc-response" and parts[1] == identifier:
+          result = parts[2]
+          break
+    else:
+      raise RuntimeError("no rpc-response in output")
+    return deserialize(result)
+
+# decorator to define a two-stage command
+@decorator_with_args
+def locally(fn, interactive=False):
+  rc = RemoteCommand.from_interactive(interactive)
+  rc.locally(fn)
+  return rc
+
+@decorator_with_args
+def remotely(fn, interactive=False):
+  rc = RemoteCommand.from_interactive(interactive)
+  rc.remotely(fn)
+  # by default, the local part is a no-op
+  def local_fn(remote, *args, **kwargs):
+    result = yield args
+    yield result
+  rc.locally(local_fn, name=fn.__name__)
+  return rc
+
+@decorator_with_args
+def remotely_only(fn, interactive=False):
+  rc = RemoteCommand.from_interactive(interactive)
+  rc.remotely(fn)
+  def local_fn(remote, *args, **kwargs):
+    raise RuntimeError("subcommand %s can only be run remotely" % fn.__name__)
+  rc.locally(local_fn, name=fn.__name__)
+  return rc
 
 class Remote(object):
-  def rundir(self, label): return Path(self.runsdir, label)
-  def ssh_rundir(self, label): return "%s:%s" % (self.host, self.rundir(label))
-  ssh_runsdir = property(lambda self: "%s:%s" % (self.host, self.runsdir))
+  def __init__(self):
+    self.database = Database(self.runsdir)
 
-  @locally
-  @labeltaking
-  def pull(self, config):
-    sp.check_call(self.ssh_wrapper + ["rsync", "-rltvz", "--ignore-missing-args"] + rsync_filter +
-                  ["%s/" % self.ssh_rundir(config.label),
-                   "%s/%s" % (local_runsdir, config.label)])
+  def pull(self, labels):
+    if not labels: return
+    self.rsync(["%s:%s" % (self.host, self.database.get_rundir(label))
+                for label in labels],
+               localdb.runsdir)
 
-  @locally
-  @labeltaking
-  def push(self, config):
-    sp.check_call(self.ssh_wrapper + ["rsync", "-rltvz"] + rsync_filter +
-                  ["%s/%s/" % (local_runsdir, config.label),
-                   self.ssh_rundir(config.label)])
+  def rsync(self, sources, destination):
+    for i in range(3):
+      try:
+        sp.check_call(self.ssh_wrapper + ["rsync", "-urltvz", "--ignore-missing-args"] +
+                      rsync_filter + sources + [destination])
+      except sp.CalledProcessError as e:
+        if e.returncode == 23:
+          # some files/attrs were not transferred -- maybe they were being written to.
+          # try again a few times
+          delay = 2 ** i
+          logging.warning("rsync failed to transfer everything, retrying in %i seconds", delay)
+          interruptible_sleep(delay)
+        else:
+          raise
+      else:
+        # success, don't retry
+        break
 
-  @remotely
-  @labeltaking
-  def visit(self, config):
-    sp.check_call("bash", cwd=str(self.rundir(config.label)))
+  def push(self, labels):
+    if not labels: return
+    self.rsync([localdb.get_rundir(label) for label in labels],
+               "%s:%s" % (self.host, self.database.runsdir))
 
-  @locally
-  @labeltaking
-  def stdout(self, config):
-    path = get_stdout_file(Path(local_runsdir, config.label))
-    if not path:
-      raise ValueError("no stdout found for %s", config.label)
-    sp.check_call(["less", "+G", path])
-
-  @locally
-  @labeltaking
-  def invocation(self, config):
-    invocation = json.loads(Path(local_runsdir, config.label, "invocation.json").read_text())
-    print(repr(invocation))
-
-  @remotely_nosync
-  @labeltaking
-  def status(self, config):
-    def mark_lost():
-      terminated_path = Path(self.runsdir, config.label, "terminated")
-      if not terminated_path.exists():
-        terminated_path.write_text("lost")
-    try:
-      job_id = Path(self.runsdir, config.label, "job_id").read_text()
-    except FileNotFoundError:
-      print(config.label, "no job_id; marking as lost")
-      mark_lost()
-    else:
-      result = sp.call(["squeue", "-j", job_id])
-      if result:
-        print("invalid job %s (marking as lost)", job_id)
-        mark_lost()
-        return result
-
-  @locally
-  @labeltaking
-  def purge(self, config):
-    self.purgemany([config])
-    return
-    sp.check_call(self.ssh_wrapper + ["ssh", self.host] +
-                  ["rm", "-rf", str(Path(self.runsdir, config.label))])
-    sp.check_call(["rm", "-r", str(Path(local_runsdir, config.label))])
-
-  @locally
-  def purgemany(self, configs):
-    print([config.label for config in configs])
+  def purge(self, labels):
+    if not labels: return
     sp.check_call(self.ssh_wrapper + ["ssh", self.host] +
                   ["rm", "-rf"] +
-                  [str(Path(self.runsdir, config.label))
-                   for config in configs])
+                  [str(self.database.get_rundir(label)) for label in labels])
     sp.check_call(["rm", "-r"] +
-                  [str(Path(local_runsdir, config.label))
-                   for config in configs])
+                  [str(localdb.get_rundir(label)) for label in labels])
 
-  @locally
-  def package(self, config, *invocation):
-    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+  @remotely(interactive=True)
+  def visit(self, label):
+    sp.check_call("bash", cwd=str(self.database.get_rundir(label)))
 
-    # gather files and determine checksum
-    path = Path(tempfile.mkdtemp())
-    sp.check_call(self.ssh_wrapper + ["rsync", "-rlzF"] + rsync_filter +
-                  ["./", str(path)])
-    checksum_output = sp.check_output(
-      # (would prefer to use find -print0 and tar --null, but the latter doesn't seem to work)
-      "tar -cf - %s | sha256sum" % path,
-      shell=True)
-    # (shortened to 128 bits or 32 hex characters to fit in screen's session name limit)
-    checksum = checksum_output.decode().splitlines()[0].split()[0][:32]
+  @remotely(interactive=False)
+  def statusmany(self, *labels):
+    statuses = dict()
+    job_ids = ordict()
 
-    # create rundir and move files into place
-    label = "%s_%s" % (timestamp, checksum)
-    make_that_dir(Path(local_runsdir, label))
-    shutil.move(path, Path(local_runsdir, label, "tree"))
+    for label in labels:
+      if not self.database.get_rundir(label).exists():
+        statuses[label] = "no remote copy"
+      else:
+        job_id = self.database.get_job_id(label)
+        if job_id is None:
+          self.database.mark_lost(label)
+          statuses[label] = "lost"
+        else:
+          job_ids[job_id] = label
 
-    Path(local_runsdir, label, "invocation.json").write_text(json.dumps(invocation))
-    config.override(label=label)
-    config.to_file(Path(local_runsdir, label, "config.json"))
-    logger.warn("invocation: %r", invocation)
-    logger.warn("label: %r", label)
+    try:
+      blob = sp.check_output(["squeue", "-O", "jobid,state,reason,timeused,timeleft", "-j", ",".join(job_ids.keys())], stderr=sp.STDOUT)
+      error = 0
+      # example output:
+      # JOBID               STATE               REASON              TIME                TIME_LEFT
+      # 11922138            PENDING             Priority            0:00                1-00:00:00
+      # 11922147            PENDING             Priority            0:00                1-00:00:00
+      # 11922157            PENDING             Priority            0:00                1-00:00:00
+      for line in blob.splitlines()[1:]:
+        line = line.decode("utf-8")
+        job_id, state, reason, timeused, timeleft = line.split()
+        statuses[job_ids[job_id]] = ordict(state=state, reason=reason, timeused=timeused, timeleft=timeleft)
+    except sp.CalledProcessError as e:
+      blob = e.output
+      error = e.returncode
+      import pdb; pdb.set_trace()
 
-  @remotely
-  @labeltaking
-  def run(self, config):
+    for job_id, label in job_ids.items():
+      if label not in statuses:
+        # this could happen if the job has terminated, in which case the local part should
+        # pull it out of the `terminated` file
+        logger.error("could not determine status of job %s with label %s", job_id, label)
+        import pdb; pdb.set_trace()
+
+    return statuses
+
+  @statusmany.locally
+  def statusmany(self, labels):
+    # FIXME would like to cancel the whole thing if no labels;
+    # find a way to communicate this to the caller
+    #if not labels: return
+    statuses = yield labels
+    for label, status in statuses.items():
+      if status == "no remote copy":
+        localdb.mark_terminated(label, "no remote copy")
+    yield statuses
+
+  @remotely_only(interactive=True)
+  def run(self, label):
     status = None
     try:
       conda_activate("py36")
       # record job number so we can determine status later, as well as whether it got started at all
-      Path(self.runsdir, config.label, "job_id").write_text(os.environ["SLURM_JOB_ID"])
-      invocation = json.loads(Path(self.runsdir, config.label, "invocation.json").read_text())
-      os.environ["DETOUR_LABEL"] = config.label # for the user program
-      # TODO: capture stdout/stderr without breaking interactivity
-      status = sp.check_call(invocation, cwd=str(Path(self.runsdir, config.label, "tree")))
+      self.database.set_job_id(label, os.environ["SLURM_JOB_ID"])
+      invocation = self.database.get_invocation(label)
+      os.environ["DETOUR_LABEL"] = label # for the user program
+      status = sp.check_call(invocation, cwd=str(Path(self.database.get_rundir(label), "tree")))
     finally:
-      # touch a file to indicate the process has terminated
-      Path(self.runsdir, config.label, "terminated").touch()
-      # record status (separate from touch in case this crashes)
       if status is None:
         status = tb.format_exc()
-      Path(self.runsdir, config.label, "terminated").write_text(str(status))
+      self.database.mark_terminated(label, status)
 
-  @locally
-  @labeltaking
-  def synchronizing(self, config):
-    while not Path(local_runsdir, config.label, "terminated").exists():
+  def synchronizing(self, label):
+    while not localdb.known_terminated(label):
       interruptible_sleep(30)
       # TODO: what to do on failure?
-      sp.call(config.to_argv("pull"),
-              stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
-
-  def enter_ssh(self, config, subcommand, *argv):
-    detour_program = os.path.realpath(sys.argv[0])
-    sp.check_call(self.ssh_wrapper + ["scp", detour_program, "%s:bin/detour" % self.host])
-    sp.check_call(self.ssh_wrapper + ["ssh", "-t", self.host] +
-                  config.with_overrides(on_remote=1).to_argv(subcommand) + list(argv))
+      self.pull([label])
 
   @contextlib.contextmanager
-  def synchronization(self, config):
-    synchronizer = sp.Popen(config.to_argv("synchronizing"),
+  def synchronization(self, label):
+    synchronizer = sp.Popen(detour_rpc_argv("synchronizing"),
                             stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
     yield
     synchronizer.terminate()
     synchronizer.wait()
-    if not Path(local_runsdir, config.label, "terminated").exists():
-      sp.check_call(config.to_argv("pull"))
+    if not localdb.known_terminated(label):
+      self.pull([label])
 
 class BatchRemote(Remote):
-  @locally
-  def launch(self, config, *argv):
-    try:
-      self.package(config, *argv)
-    except KeyboardInterrupt:
-      self.purge(config)
-    self.push(config)
-    self.enter_job(config)
+  def launch(self, labels):
+    self.push(labels)
+    self.submit_jobs(labels)
 
-  @remotely_nosync
-  @labeltaking
-  def enter_job(self, config):
-    rundir = self.rundir(config.label)
-    make_that_dir(rundir)
+  @remotely(interactive=False)
+  def submit_jobs(self, labels):
+    for label in labels:
+      rundir = self.database.ensure_rundir(label)
 
-    # make a script describing the job
-    command = " ".join(config.to_argv("run"))
-    Path(rundir, "sbatch.sh").write_text(textwrap.dedent("""
-         #!/bin/bash
-         #SBATCH --time=23:59:59
-         #SBATCH --account=rpp-bengioy
-         #SBATCH --mem=16G
-         #SBATCH --gres=gpu:1
-         # some jobs need big gpus :-/
-         ##SBATCH --gres=gpu:lgpu:4
-         module load cuda/9.0.176 cudnn/7.0
-         export LD_LIBRARY_PATH=$EBROOTCUDA/lib64:$EBROOTCUDNN/lib64:$LD_LIBRARY_PATH
-         echo $HOSTNAME
-         nvidia-smi
-         %s
-         """ % command).strip())
+      # make a script describing the job
+      command = " ".join(detour_rpc_argv("run", label))
+      Path(rundir, "sbatch.sh").write_text(textwrap.dedent("""
+          #!/bin/bash
+          #SBATCH --time=23:59:59
+          #SBATCH --account=rpp-bengioy
+          #SBATCH --mem=16G
+          #SBATCH --gres=gpu:1
+          # some jobs need big gpus :-/
+          ##SBATCH --gres=gpu:lgpu:4
+          module load cuda/9.0.176 cudnn/7.0
+          export LD_LIBRARY_PATH=$EBROOTCUDA/lib64:$EBROOTCUDNN/lib64:$LD_LIBRARY_PATH
+          echo $HOSTNAME
+          nvidia-smi
+          %s
+          """ % command).strip())
 
-    output = sp.check_output(["sbatch", "sbatch.sh"], cwd=str(rundir))
-    match = re.match(rb"\s*Submitted\s*batch\s*job\s*(?P<id>[0-9]+)\s*", output)
-    if not match:
-      print(output)
-    Path(rundir, "job_id").write_bytes(match.group("id"))
-
-  # just making sure this isn't getting called
-  def enter_screen(self, config): assert False
+      output = sp.check_output(["sbatch", "sbatch.sh"], cwd=str(rundir))
+      match = re.match(rb"\s*Submitted\s*batch\s*job\s*(?P<id>[0-9]+)\s*", output)
+      if not match:
+        print(output)
+        import pdb; pdb.set_trace()
+      job_id = match.group("id").decode("ascii")
+      self.database.set_job_id(label, job_id)
+      return job_id
 
 class InteractiveRemote(Remote):
-  @locally
-  def launch(self, config, *argv):
-    self.package(config, *argv)
-    self.push(config)
-    self.enter_screen(config)
+  def launch(self, labels):
+    self.push(labels)
+    # interactive means run one by one
+    for label in labels:
+      self.enter_screen(label)
 
-  @remotely
-  @labeltaking
-  def enter_screen(self, config):
-    rundir = self.rundir(config.label)
-    make_that_dir(rundir)
+  @remotely(interactive=True)
+  def enter_screen(self, label):
+    rundir = self.database.ensure_rundir(label)
 
-    screenlabel = get_screenlabel(config.label)
+    screenlabel = self.database.get_screenlabel(label)
     sp.check_call(["pkscreen", "-S", screenlabel], cwd=str(rundir))
     # wrap in `script` to capture output
     sp.check_call(["screen", "-S", screenlabel, "-p", "0", "-X", "stuff",
@@ -556,30 +702,36 @@ class InteractiveRemote(Remote):
     # NOTE: too bad the command is "detour ..." which isn't really helpful
     # NOTE: && exit ensures screen terminates iff the command terminated successfully.
     sp.check_call(["screen", "-S", screenlabel, "-p", "0", "-X", "stuff",
-                   "%s && exit^M" % " ".join(config.to_argv("enter_job"))],
+                   "%s && exit^M" % " ".join(detour_rpc_argv("submit_job", label))],
                   cwd=str(rundir))
     sp.check_call(["screen", "-x", screenlabel],
                   env=dict(TERM="xterm-color"))
 
-  @remotely
-  @labeltaking
-  def enter_job(self, config):
+  @enter_screen.locally
+  def enter_screen(self, label):
+    with self.synchronization(label):
+      yield [label]
+
+  @remotely_only(interactive=True)
+  def submit_job(self, label):
     excluded_hosts = [
       "mila00", # requires nvidia acknowledgement
       "mila01", # requires nvidia acknowledgement
+      "bart10", # intermittent pauses? september 2018
     ]
     sp.check_call(["sinter", "--gres=gpu", "-Cgpu12gb", "--qos=unkillable", "--mem=16G",
                    "--exclude=%s" % ",".join(excluded_hosts),
                    # bash complains about some ioctl mystery, but it's fine
-                   "bash", "-lic", " ".join(config.to_argv("run"))])
+                   "bash", "-lic", " ".join(detour_rpc_argv("run", label))])
 
-  @remotely
-  @labeltaking
-  def attach(self, config):
-    sp.check_call(["screen", "-x", get_screenlabel(config.label)])
+  @remotely(interactive=True)
+  def attach(self, label):
+    sp.check_call(["screen", "-x", self.database.get_screenlabel(label)])
 
-def get_screenlabel(label):
-  return "detour_%s" % label
+  @attach.locally
+  def attach(self, label):
+    with self.synchronization(label):
+      yield [label]
 
 def interruptible_sleep(seconds):
   for second in range(seconds):
@@ -598,5 +750,46 @@ def conda_activate(name):
   os.environ["PATH"] = "%s:%s" % (os.path.join(os.environ["CONDA_PREFIX"], "bin"),
                                   os.environ["PATH"])
 
+def make_that_dir(path):
+  path = str(path) # convert pathlib Path (which has mkdir but exist_ok is py>=3.5)
+  os.makedirs(path, exist_ok=True)
+
+def dedup(xs):
+  seen = set()
+  ys = []
+  for x in xs:
+    if x not in seen:
+      seen.add(x)
+      ys.append(x)
+  return ys
+
+def abridge(s, maxlen=80):
+  if len(s) < maxlen: return s
+  k = (maxlen - 3) // 2
+  return s[:k] + "..." + s[len(s) - k:]
+
+def groupby(iterable, key):
+  groups = ddict(list)
+  for item in iterable:
+    groups[key(item)].append(item)
+  return groups
+
+def parse_bool_arg(s):
+  if s.lower() in "yes true t y 1".split(): return True
+  elif s.lower() in "no false f n 0".split(): return False
+  else: raise argparse.ArgumentTypeError('Boolean value expected.')
+
+def check_output_interactive(command):
+  import pty, os
+  master, slave = pty.openpty()
+  output = []
+  def read(fd):
+    data = os.read(fd, 1024)
+    output.append(data.decode("utf-8"))
+    return data
+  pty.spawn(command, read)
+  return "".join(output)
+
 if __name__ == "__main__":
-  main(sys.argv)
+  logger.debug(sys.argv[1:])
+  Main()(sys.argv[1:])
