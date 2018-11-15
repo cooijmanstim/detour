@@ -34,6 +34,8 @@ rsync_filter = """
 """.strip().split() + ["--filter=: /.d2filter"]
 
 class Database(object):
+  # TODO: all these getters and setters suggest a Run object that manages each run's properties
+
   def __init__(self, runsdir):
     self.runsdir = runsdir
 
@@ -69,6 +71,18 @@ class Database(object):
   def get_remote(self, label):
     return get_remote(self.get_remote_key(label))
 
+  def get_job_id(self, label):
+    try:
+      return self.get_job_id_path(label).read_text()
+    except FileNotFoundError:
+      return None
+
+  def set_job_id(self, label, job_id):
+    self.get_job_id_path(label).write_text(job_id)
+
+  def get_job_id_path(self, label):
+    return Path(self.runsdir, label, "job_id")
+
   def known_terminated(self, label):
     return self.get_terminated_path(label).exists()
 
@@ -77,12 +91,34 @@ class Database(object):
 
   def mark_terminated(self, label, context):
     terminated_path = self.get_terminated_path(label)
-    assert not terminated_path.exists()
+    if terminated_path.exists():
+      logger.warning("overwriting termination file for run %s", label)
     terminated_path.touch()
     terminated_path.write_text(context)
 
   def mark_lost(self, label):
     self.mark_terminated(label, "lost")
+
+  def unmark_lost(self, label):
+    assert self.is_marked_lost(label)
+    self.get_terminated_path(label).unlink()
+
+  def is_marked_lost(self, label):
+    try:
+      return self.get_terminated_path(label).read_text() == "lost"
+    except FileNotFoundError:
+      return False
+
+  def clear_state(self, label):
+    try:
+      self.get_job_id_path(label).unlink()
+    except FileNotFoundError:
+      pass
+    try:
+      self.get_terminated_path(label).unlink()
+    except FileNotFoundError:
+      pass
+    # we can probably leave the output files of past runs?
 
   def package(self, *invocation, **config):
     try:
@@ -125,42 +161,69 @@ class Database(object):
   def get_screenlabel(self, label):
     return "detour_%s" % label
 
-  def get_stdout_file(self, label):
-    for pattern in "session.script slurm-*.out".split():
+  def get_stdout_path(self, label):
+    for pattern in "session*.script slurm-*.out".split():
       expression = str(Path(self.runsdir, label, pattern))
       paths = glob.glob(expression)
       if paths:
         path, = paths
-        return path
+        return Path(path)
     return None
 
-  def get_status(self, label):
-    try:
-      status = self.get_terminated_path(label).read_text()
-    except FileNotFoundError:
-      status = "unterminated"
-    if "CalledProcessError" in status:
-      # uninformative exception in "detour run" command; extract the true exception from slurm-*.out
-      exceptions = self.extract_exceptions(label)
-      exceptions = [abridge(ex, 80) for ex in exceptions]
-      status = "; ".join(exceptions)
-    return status
-
-  def extract_exceptions(self, label):
-    stdout_path = self.get_stdout_file(label)
+  def get_output(self, label):
+    stdout_path = self.get_stdout_path(label)
     if not stdout_path:
       logger.warning("no stdout found for %s", label)
-      return []
+      return ""
+    return stdout_path.read_text()
 
+  def get_status(self, label):
+    def _from_output(label):
+      output = self.get_output(label)
+      errors = self.extract_errors(output)
+      errors = [abridge(error, 80) for error in errors]
+      return "; ".join(errors)
+
+    try:
+      status = self.get_terminated_path(label).read_text()
+      # status may be a traceback in case of exception
+      if "CalledProcessError" in status:
+        # uninformative exception in "detour run" command; extract the true exception from slurm-*.out
+        status = _from_output(label)
+    except FileNotFoundError:
+      # check the output for slurm errors. e.g.:
+      # slurmstepd: error: *** JOB 11943965 ON cdr248 CANCELLED AT 2018-09-18T09:30:03 DUE TO TIME LIMIT ***
+      status = _from_output(label)
+      # not marked as terminated; either the job has not terminated, or
+      # it was terminated abruptly, e.g. by SIGKILL from slurm
+      if not status:
+        status = "unterminated"
+    return status
+
+  def extract_errors(self, output):
+    errors = []
+    if "slurmstepd: error:" in output:
+      # if there is a slurmstepd error, it is almost certainly the sole reason the job
+      # crashed. python would never get a chance to handle any exceptions caused by it.
+      re_slurm_error = re.compile(r"^slurmstepd:\s*error:\s*(?P<error>.*)$")
+      for line in reversed(output.splitlines()):
+        match = re_slurm_error.match(line)
+        if match:
+          errors.append(match.group("error"))
+    else:
+      exceptions = self.extract_exceptions(output)
+      errors.extend(exceptions)
+    return errors
+
+  def extract_exceptions(self, output):
     re_ansi_escape = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
     re_exception = re.compile(r"^[A-Za-z_.]+(Error|Exception)\s*:\s*.*$")
     exceptions = []
-    with open(stdout_path, "r") as stdout:
-      for line in stdout:
-        line = re_ansi_escape.sub("", line)
-        match = re_exception.match(line)
-        if match:
-          exceptions.append(line.strip())
+    for line in output.splitlines():
+      line = re_ansi_escape.sub("", line)
+      match = re_exception.match(line)
+      if match:
+        exceptions.append(line.strip())
     exceptions = dedup(exceptions)
     def fn(ex):
       # attempt to filter out uninteresting exceptions while keeping kills
@@ -216,6 +279,8 @@ def detour_parse_argv(*argv):
   parser = argparse.ArgumentParser()
   parser.add_argument("--on_remote", choices="local mila cedar".split())
   parser.add_argument("--verbose", default=False, action="store_true")
+  parser.add_argument("--ignore-cache", default=False, action="store_true",
+                      help="force pull of remote information even if local mirror indicates jobs terminated/lost")
   parser.add_argument("subcommand")
   parser.add_argument("argv", nargs=argparse.REMAINDER)
   args = parser.parse_args(argv)
@@ -319,15 +384,40 @@ class Main(object):
   def studystatus(study):
     labels = list(localdb.study_labels(study))
     statuses = get_statuses(labels)
-    for status, labels in groupby(labels, lambda label: statuses[label]).items():
+    def criterion(label):
+      status = statuses[label]
+      if isinstance(status, dict):
+        return status["state"]
+      else:
+        return status
+    for status, labels in groupby(labels, criterion).items():
       print(len(labels), "runs:", status)
       if global_config.get("verbose", False):
         for label in labels:
           print("  ", label)
 
   @subcommand
+  def resubmit(*labels):
+    for remote, labels in localdb.by_remote(labels):
+      remote.resubmit(labels)
+
+  @subcommand
+  def resubmitunrun(study):
+    labels = list(localdb.study_labels(study))
+    statuses = get_statuses(labels)
+    unrun_labels = [label for label in labels
+                    if statuses[label] in ["lost", "no remote copy"]]
+    print("about to resubmit %i unrun jobs" % len(unrun_labels))
+    import pdb; pdb.set_trace()
+    for remote, labels in localdb.by_remote(unrun_labels):
+      remote = get_remote(remote)
+      push_labels = [label for label in labels if statuses[label] == "no remote copy"]
+      remote.push(push_labels)
+      remote.resubmit(labels)
+
+  @subcommand
   def stdout(label):
-    path = localdb.get_stdout_file(label)
+    path = localdb.get_stdout_path(label)
     if not path:
       raise ValueError("no stdout found for %s", label)
     sp.check_call(["less", "+G", path])
@@ -339,17 +429,34 @@ class Main(object):
   @subcommand
   def attach(label): localdb.get_remote(label).attach(label)
 
+  @subcommand
+  def studies(runsdir=None):
+    db = Database(runsdir) if runsdir is not None else localdb
+    for study, configs in groupby(db.configs, lambda config: config["study"]).items():
+      print("%50s %4i runs on %s"
+            % (study, len(configs),
+               ", ".join("%s (%i)" % (remote, len(remote_configs))
+                         for remote, remote_configs in
+                         groupby(configs, lambda config: config["remote"]).items())))
+      if global_config.get("verbose", False):
+        for config in configs:
+          print("  ", config["label"], config["remote"])
+
 def get_statuses(labels):
   all_labels = labels
   statuses = ddict()
-  for remote, labels in groupby(labels, localdb.get_remote_key).items():
-    print(remote, labels)
+  for remote, labels in localdb.by_remote(labels):
     remote = get_remote(remote)
-    unterminated = [label for label in labels if not localdb.known_terminated(label)]
-    remote.pull(unterminated)
+    if global_config.get("ignore_cache", False):
+      # pull all labels whether locally considered terminated or not
+      remote.pull(labels)
+    else:
+      unterminated = [label for label in labels if not localdb.known_terminated(label)]
+      if unterminated:
+        remote.pull(unterminated)
     # for unterminated, figure out statuses remotely
     unterminated = [label for label in labels if not localdb.known_terminated(label)]
-    if unterminated:
+    if unterminated or global_config.get("ignore_cache", False):
       statuses.update(remote.statusmany(unterminated))
     # for terminated, figure out statuses locally
     terminated = [label for label in labels if localdb.known_terminated(label)]
@@ -525,22 +632,23 @@ class Remote(object):
                localdb.runsdir)
 
   def rsync(self, sources, destination):
-    for i in range(3):
-      try:
-        sp.check_call(self.ssh_wrapper + ["rsync", "-urltvz", "--ignore-missing-args"] +
-                      rsync_filter + sources + [destination])
-      except sp.CalledProcessError as e:
-        if e.returncode == 23:
-          # some files/attrs were not transferred -- maybe they were being written to.
-          # try again a few times
-          delay = 2 ** i
-          logging.warning("rsync failed to transfer everything, retrying in %i seconds", delay)
-          interruptible_sleep(delay)
+    for subset in segments(sources, 100):
+      for i in range(5):
+        try:
+          sp.check_call(self.ssh_wrapper + ["rsync", "-urltvz", "--ignore-missing-args"] +
+                        rsync_filter + subset + [destination])
+        except sp.CalledProcessError as e:
+          if e.returncode == 23:
+            # some files/attrs were not transferred -- maybe they were being written to.
+            # try again a few times
+            delay = 2 ** i
+            logging.warning("rsync failed to transfer everything, retrying in %i seconds", delay)
+            interruptible_sleep(delay)
+          else:
+            raise
         else:
-          raise
-      else:
-        # success, don't retry
-        break
+          # success, don't retry
+          break
 
   def push(self, labels):
     if not labels: return
@@ -560,7 +668,7 @@ class Remote(object):
     sp.check_call("bash", cwd=str(self.database.get_rundir(label)))
 
   @remotely(interactive=False)
-  def statusmany(self, *labels):
+  def statusmany(self, labels):
     statuses = dict()
     job_ids = ordict()
 
@@ -590,27 +698,39 @@ class Remote(object):
     except sp.CalledProcessError as e:
       blob = e.output
       error = e.returncode
-      import pdb; pdb.set_trace()
+      if "Invalid job id specified" in blob.decode("utf-8"):
+        # a preliminary trial suggests this error only occurs when len(job_ids) == 1, and
+        # invalid job ids are ignored otherwise. we can ignore this error.
+        # the missing entries in statuses will be caught below.
+        pass
+      else:
+        logging.error("something went wrong in call to squeue, dropping into pdb")
+        import pdb; pdb.set_trace()
 
     for job_id, label in job_ids.items():
       if label not in statuses:
         # this could happen if the job has terminated, in which case the local part should
-        # pull it out of the `terminated` file
-        logger.error("could not determine status of job %s with label %s", job_id, label)
-        import pdb; pdb.set_trace()
+        # pull it out of the `terminated` file. however due to race conditions (the job
+        # terminated in the time it took for control to arrive here) we'll take care of it.
+        statuses[label] = self.database.get_status(label)
+
+    if any(label not in statuses for label in job_ids.values()):
+      logger.error("could not determine status of the following jobs:")
+      for job_id, label in job_ids.items():
+        if label not in statuses:
+          logger.error("job %s with label %s", job_id, label)
+      import pdb; pdb.set_trace()
 
     return statuses
 
   @statusmany.locally
-  def statusmany(self, labels):
-    # FIXME would like to cancel the whole thing if no labels;
-    # find a way to communicate this to the caller
-    #if not labels: return
-    statuses = yield labels
+  def statusmany(self, labels, call_remote):
+    if not labels: return dict()
+    statuses = call_remote(labels)
     for label, status in statuses.items():
       if status == "no remote copy":
         localdb.mark_terminated(label, "no remote copy")
-    yield statuses
+    return statuses
 
   @remotely_only(interactive=True)
   def run(self, label):
@@ -618,15 +738,19 @@ class Remote(object):
     try:
       conda_activate("py36")
       # record job number so we can determine status later, as well as whether it got started at all
-      self.database.set_job_id(label, os.environ["SLURM_JOB_ID"])
+      job_id = os.environ["SLURM_JOB_ID"]
+      self.database.set_job_id(label, job_id)
+      logger.warning("detour run label %s job_id %s start %s", label, job_id, get_timestamp())
       invocation = self.database.get_invocation(label)
       os.environ["DETOUR_LABEL"] = label # for the user program
+      logger.warning("invoking %s", invocation)
       status = sp.check_call(invocation, cwd=str(Path(self.database.get_rundir(label), "tree")))
     finally:
       if status is None:
         status = tb.format_exc()
-      self.database.mark_terminated(label, status)
+      self.database.mark_terminated(label, str(status))
 
+  @locally(interactive=False)
   def synchronizing(self, label):
     while not localdb.known_terminated(label):
       interruptible_sleep(30)
@@ -649,52 +773,79 @@ class BatchRemote(Remote):
     self.submit_jobs(labels)
 
   @remotely(interactive=False)
-  def submit_jobs(self, labels):
+  def resubmit(self, labels):
+    job_ids = dict()
     for label in labels:
-      rundir = self.database.ensure_rundir(label)
+      # clear state before call to _submit_job, not after, to avoid clearing new job_id
+      self.database.clear_state(label)
+      job_ids[label] = self._submit_job(label)
+    return job_ids
 
-      # make a script describing the job
-      command = " ".join(detour_rpc_argv("run", label))
-      Path(rundir, "sbatch.sh").write_text(textwrap.dedent("""
-          #!/bin/bash
-          #SBATCH --time=23:59:59
-          #SBATCH --account=rpp-bengioy
-          #SBATCH --mem=16G
-          #SBATCH --gres=gpu:1
-          # some jobs need big gpus :-/
-          ##SBATCH --gres=gpu:lgpu:4
-          module load cuda/9.0.176 cudnn/7.0
-          export LD_LIBRARY_PATH=$EBROOTCUDA/lib64:$EBROOTCUDNN/lib64:$LD_LIBRARY_PATH
-          echo $HOSTNAME
-          nvidia-smi
-          %s
-          """ % command).strip())
+  @resubmit.locally
+  def resubmit(self, labels, call_remote):
+    job_ids = call_remote(labels)
+    # clear state of the jobs that the remote has launched
+    for label in job_ids.keys():
+      localdb.clear_state(label)
+    return job_ids
 
-      output = sp.check_output(["sbatch", "sbatch.sh"], cwd=str(rundir))
-      match = re.match(rb"\s*Submitted\s*batch\s*job\s*(?P<id>[0-9]+)\s*", output)
-      if not match:
-        print(output)
-        import pdb; pdb.set_trace()
-      job_id = match.group("id").decode("ascii")
-      self.database.set_job_id(label, job_id)
-      return job_id
+  @remotely(interactive=False)
+  def submit_jobs(self, labels):
+    job_ids = dict()
+    for label in labels:
+      job_ids[label] = self._submit_job(label)
+    return job_ids
+
+  def _submit_job(self, label):
+    interruptible_sleep(2)
+
+    rundir = self.database.ensure_rundir(label)
+
+    # make a script describing the job
+    command = " ".join(detour_rpc_argv("run", label))
+    Path(rundir, "sbatch.sh").write_text(textwrap.dedent("""
+        #!/bin/bash
+        #SBATCH --time=23:59:59
+        ##SBATCH --time=1:00:00
+        #SBATCH --account=rpp-bengioy
+        #SBATCH --mem=16G
+        #SBATCH --gres=gpu:1
+        # some jobs need big gpus :-/
+        ##SBATCH --gres=gpu:lgpu:4
+        module load cuda/9.0.176 cudnn/7.0
+        export LD_LIBRARY_PATH=$EBROOTCUDA/lib64:$EBROOTCUDNN/lib64:$LD_LIBRARY_PATH
+        echo $HOSTNAME
+        nvidia-smi
+        %s
+        """ % command).strip())
+
+    output = sp.check_output(["sbatch", "sbatch.sh"], cwd=str(rundir))
+    match = re.match(rb"\s*Submitted\s*batch\s*job\s*(?P<id>[0-9]+)\s*", output)
+    if not match:
+      print(output)
+      import pdb; pdb.set_trace()
+    job_id = match.group("id").decode("ascii")
+    self.database.set_job_id(label, job_id)
+    return job_id
 
 class InteractiveRemote(Remote):
   def launch(self, labels):
-    self.push(labels)
     # interactive means run one by one
     for label in labels:
+      self.push([label])
+      logger.warning("enter_screen %s", label)
       self.enter_screen(label)
 
   @remotely(interactive=True)
   def enter_screen(self, label):
+    logger.warning("entered_screen %s", label)
     rundir = self.database.ensure_rundir(label)
 
     screenlabel = self.database.get_screenlabel(label)
     sp.check_call(["pkscreen", "-S", screenlabel], cwd=str(rundir))
     # wrap in `script` to capture output
     sp.check_call(["screen", "-S", screenlabel, "-p", "0", "-X", "stuff",
-                   "script -e session.script && exit^M"], cwd=str(rundir))
+                   "script -e session_%s.script && exit^M" % get_timestamp()], cwd=str(rundir))
     # `stuff` sends the given string to stdin, i.e. we run the command as if the user had typed
     # it.  the benefit is that we can attach and we are in a bash prompt with exactly the same
     # environment as the program ran in (as opposed to would be the case with some other ways of
@@ -790,6 +941,23 @@ def check_output_interactive(command):
   pty.spawn(command, read)
   return "".join(output)
 
+
+def random_string(length):
+  import random, string
+  alphabet = string.ascii_lowercase + string.ascii_uppercase + string.digits
+  return "".join(random.SystemRandom().choice(alphabet) for _ in range(length))
+
+def get_timestamp():
+  return datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+def segments(xs, k):
+  iterator = iter(xs)
+  while True:
+    slice = list(it.islice(iterator, k))
+    if not slice:
+      break
+    yield slice
+
 if __name__ == "__main__":
-  logger.debug(sys.argv[1:])
+  #logger.debug(sys.argv[1:])
   Main()(sys.argv[1:])
