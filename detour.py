@@ -31,6 +31,8 @@ rsync_filter = """
   --exclude __pycache__
   --exclude *.npz*-numpy.npy
   --exclude *.ipynb
+  --exclude *.pdf
+  --exclude altair*.json
 """.strip().split() + ["--filter=: /.d2filter"]
 
 class Database(object):
@@ -46,6 +48,15 @@ class Database(object):
     rundir = self.get_rundir(label)
     make_that_dir(rundir)
     return rundir
+
+  def exists(self, label):
+    return self.get_rundir(label).exists()
+
+  @property
+  def configs(self):
+    for config_path in glob.glob(os.path.join(self.runsdir, "*", "config.json")):
+      config = json.loads(Path(config_path).read_text())
+      yield config
 
   def set_invocation(self, label, invocation):
     self.get_invocation_path(label).write_text(json.dumps(invocation))
@@ -70,6 +81,11 @@ class Database(object):
 
   def get_remote(self, label):
     return get_remote(self.get_remote_key(label))
+
+  def by_remote(self, labels):
+    for remote_key, labels in groupby(labels, self.get_remote_key).items():
+      remote = get_remote(remote_key)
+      yield remote, labels
 
   def get_job_id(self, label):
     try:
@@ -340,7 +356,7 @@ class Main(object):
 
   @subcommand
   def launch(*labels):
-    for remote, labels in groupby(labels, localdb.get_remote).items():
+    for remote, labels in localdb.by_remote(labels):
       remote.launch(labels)
 
   @subcommand
@@ -357,28 +373,29 @@ class Main(object):
   @subcommand
   def pullstudy(study):
     labels = list(localdb.study_labels(study))
-    for remote, labels in groupby(labels, localdb.get_remote).items():
+    for remote, labels in localdb.by_remote(labels):
       remote.pull(labels)
 
   @subcommand
   def push(*labels):
-    for remote, labels in groupby(labels, localdb.get_remote).items():
+    for remote, labels in localdb.by_remote(labels):
       remote.push(labels)
 
   @subcommand
   def pull(*labels):
-    for remote, labels in groupby(labels, localdb.get_remote).items():
+    for remote, labels in localdb.by_remote(labels):
       remote.pull(labels)
 
   @subcommand
   def purge(*labels):
-    for remote, labels in groupby(labels, localdb.get_remote).items():
+    labels = [label for label in labels if localdb.exists(label)]
+    for remote, labels in localdb.by_remote(labels):
       remote.purge(labels)
 
   @subcommand
   def purgestudy(study):
     labels = list(localdb.study_labels(study))
-    for remote, labels in groupby(labels, localdb.get_remote).items():
+    for remote, labels in localdb.by_remote(labels):
       remote.purge(labels)
 
   @subcommand
