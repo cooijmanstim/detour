@@ -46,9 +46,9 @@ class FunctionTree:
       self.children[k] = v
 
 @FunctionTree
-def main(*, on_remote=None, verbose=False, ignore_cache=False):
+def main(*, on_remote=None):
   try:
-    G.config.update(on_remote=on_remote, verbose=verbose, ignore_cache=ignore_cache)
+    G.config.update(on_remote=on_remote)
     G.localdb = Database(".detours")
     yield
   except Exception: # TODO was "except:"; trying to let keyboardinterrupt pass through
@@ -57,12 +57,11 @@ def main(*, on_remote=None, verbose=False, ignore_cache=False):
     raise
 @main.add_children
 class _:
-  # TODO many of these should accept a study name or label interchangeably
+
+  # remote procedure calls
   def rpc(method, *rpc_argv):
-    remote = G.config.on_remote
-    assert remote
+    remote = get_remote(G.config.on_remote)
     args, kwargs = RPCCodec.decode_args(*rpc_argv) # NOTE kwargs may include rpc_identifier
-    remote = get_remote(remote)
     try:
       with Path(remote.database.runsdir, "detour_rpc_log").open("a") as log:
         log.write("%s %r %r\n" % (method, args, kwargs))
@@ -72,6 +71,8 @@ class _:
     # decode and print an rpc argv
     args, kwargs = RPCCodec.decode_args(*rpc_argv)
     print(method, args, kwargs)
+
+  # packaging and launching runs
   def launchcmd(*invocation, remote=None, interactive=False, study=None, preset=None):
     label = G.localdb.package(*invocation, study=study, remote=remote)
     remote = G.localdb.get_remote(label)
@@ -85,44 +86,39 @@ class _:
   def package(*invocation, remote=None, study=None):
     label = G.localdb.package(*invocation, study=study, remote=remote)
     print(label)
-  def pullstudy(study):
-    labels = list(G.localdb.study_labels(study))
-    for remote, labels in G.localdb.by_remote(labels):
-      remote.pull(labels)
-  def push(*labels):
-    for remote, labels in G.localdb.by_remote(labels):
-      remote.push(labels)
-  def pull(*labels):
-    for remote, labels in G.localdb.by_remote(labels):
-      remote.pull(labels)
-  def purge(*labels):
-    labels = [label for label in labels if G.localdb.exists(label)]
-    for remote, labels in G.localdb.by_remote(labels):
-      remote.purge(labels)
-  def purgestudy(study):
-    labels = list(G.localdb.study_labels(study))
-    for remote, labels in G.localdb.by_remote(labels):
-      remote.purge(labels)
-  def studystatus(study):
-    labels = list(G.localdb.study_labels(study))
-    statuses = get_statuses(labels)
+
+  def visit(label): do_single_remote(label, "visit")
+  def attach(label): do_single_remote(label, "attach")
+  def push(*labels): do_bulk_remote(labels, "push")
+  def pull(*labels): do_bulk_remote(labels, "pull")
+  def purge(*labels): do_bulk_remote(labels, "purge", ignore_nonexistent=True)
+
+  def stdout(label):
+    path = G.localdb.get_stdout_path(label)
+    if not path:
+      raise ValueError("no stdout found for %s", label)
+    sp.check_call(["less", "+G", path])
+
+  def status(*labels, verbose=False, refresh=False):
+    labels = G.localdb.designated_labels(labels)
+    statuses = get_statuses(labels, ignore_cache=refresh)
     def criterion(label):
       status = statuses[label]
-      if isinstance(status, dict):
-        return status["state"]
-      else:
-        return status
+      if isinstance(status, dict): return status["state"]
+      else:                        return status
     for status, labels in groupby(labels, criterion).items():
       print(len(labels), "runs:", status)
-      if G.config.verbose:
+      if verbose:
         for label in labels:
           print("  ", label)
+
   def resubmit(*labels):
+    labels = G.localdb.designated_labels(labels)
     for remote, labels in G.localdb.by_remote(labels):
       remote.resubmit(labels)
-  def resubmitunrun(study):
-    labels = list(G.localdb.study_labels(study))
-    statuses = get_statuses(labels)
+  def resubmitunrun(*labels, refresh=False):
+    labels = G.localdb.designated_labels(labels)
+    statuses = get_statuses(labels, ignore_cache=refresh)
     unrun_labels = [label for label in labels
                     if statuses[label] in ["lost", "no remote copy"]]
     print("about to resubmit %i unrun jobs" % len(unrun_labels))
@@ -130,21 +126,11 @@ class _:
       print(unrun_label)
     import pdb; pdb.set_trace()
     for remote, labels in G.localdb.by_remote(unrun_labels):
-      remote = get_remote(remote)
       push_labels = [label for label in labels if statuses[label] == "no remote copy"]
       remote.push(push_labels)
       remote.resubmit(labels)
-  def stdout(label):
-    path = G.localdb.get_stdout_path(label)
-    if not path:
-      raise ValueError("no stdout found for %s", label)
-    sp.check_call(["less", "+G", path])
-  def visit(label): G.localdb.get_remote(label).visit(label)
-  def status(label):
-    status = G.localdb.get_remote(label).statusmany([label])
-    print(label, status[label])
-  def attach(label): G.localdb.get_remote(label).attach(label)
-  def studies(runsdir=None):
+
+  def studies(runsdir=None, *, verbose=False):
     db = Database(runsdir) if runsdir is not None else G.localdb
     def get_total_size(configs):
       return db.get_total_size([config["label"] for config in configs])
@@ -155,16 +141,16 @@ class _:
                         (remote, len(remote_configs), get_total_size(remote_configs))
                         for remote, remote_configs in
                         groupby(configs, lambda config: config["remote"]).items())))
-      if G.config.verbose:
+      if verbose:
         for config in configs:
           print("  ", config["label"], config["remote"], get_total_size([config]))
 
 
-def get_statuses(labels):
+def get_statuses(labels, ignore_cache=False):
   all_labels = labels
   statuses = ddict()
   for remote, labels in G.localdb.by_remote(labels):
-    if G.config.ignore_cache:
+    if ignore_cache:
       # pull all labels whether locally considered terminated or not
       remote.pull(labels)
     else:
@@ -173,13 +159,21 @@ def get_statuses(labels):
         remote.pull(unterminated)
     # for unterminated, figure out statuses remotely
     unterminated = [label for label in labels if not G.localdb.known_terminated(label)]
-    if unterminated or G.config.ignore_cache:
+    if unterminated or ignore_cache:
       statuses.update(remote.statusmany(unterminated))
     # for terminated, figure out statuses locally
     terminated = [label for label in labels if G.localdb.known_terminated(label)]
     statuses.update((label, G.localdb.get_status(label)) for label in terminated)
   assert set(statuses.keys()) == set(all_labels)
   return statuses
+
+def do_bulk_remote(labels, method, ignore_nonexistent=False):
+  labels = G.localdb.designated_labels(labels, ignore_nonexistent=ignore_nonexistent)
+  for remote, labels in G.localdb.by_remote(labels):
+    getattr(remote, method)(labels)
+def do_single_remote(label, method):
+  remote = G.localdb.get_remote(label)
+  getattr(remote, method)(label)
 
 
 class RemoteCommand(object):
@@ -771,6 +765,15 @@ class Database(object):
       config = json.loads(Path(path).read_text())
       if config.get("study", None) == study:
         yield config["label"]
+  def designated_labels(self, labels, ignore_nonexistent=False):
+    result = []
+    for label in labels:
+      path = self.get_rundir(label)
+      if path.exists():
+        result.append(label)
+      else: # assume it's a study
+        result.extend(self.study_labels(label))
+    return result
 
   def get_screenlabel(self, label):
     return "detour_%s" % label
