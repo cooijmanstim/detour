@@ -728,37 +728,31 @@ class Database(object):
     # we can probably leave the output files of past runs?
 
   def package(self, *invocation, **config):
-    try:
-      timestamp = get_timestamp()
-
-      # NOTE: did I want to include invocation in the digest?
-      # gather files and determine checksum
-      path = Path(tempfile.mkdtemp())
+    # NOTE: did I want to include invocation in the digest?
+    # gather files and determine checksum
+    with tempfile.TemporaryDirectory() as tmpdir:
+      path = Path(tmpdir, "tree")
       sp.check_call(["rsync", "-rlzF"] + rsync_filter + ["./", str(path)])
       digest_output = sp.check_output(
         # (would prefer to use find -print0 and tar --null, but the latter doesn't seem to work)
         "tar -cf - %s | sha256sum" % path,
-        shell=True)
+        shell=True, cwd=tmpdir)
       # with timestamp, 4 characters (32 bits) should be plenty
       digest = digest_output.decode().splitlines()[0].split()[0][:4]
 
+      timestamp = get_timestamp()
       label = "%s_%s" % (timestamp, digest)
-      config["label"] = label
 
       # create rundir and move files into place
       shutil.move(path, Path(self.ensure_rundir(label), "tree"))
 
-      self.set_invocation(label, invocation)
-      self.set_config(label, config)
-
-      logger.warning("invocation: %r", invocation)
-      logger.warning("label: %r", label)
-      logger.warning("config: %r", config)
-
-      return label
-    except KeyboardInterrupt:
-      assert False # FIXME remove packagage wherever it is
-      raise
+    config["label"] = label
+    self.set_invocation(label, invocation)
+    self.set_config(label, config)
+    logger.warning("invocation: %r", invocation)
+    logger.warning("label: %r", label)
+    logger.warning("config: %r", config)
+    return label
 
   def study_labels(self, study):
     for path in sorted(glob.glob(self.runsdir + "/*/config.json")):
