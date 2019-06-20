@@ -771,7 +771,7 @@ class Database(object):
           raise KeyError("unknown run or study", label)
         result.extend(study_labels)
     if deduplicate:
-      result = list(set(result))
+      result = dedup(result)
     return result
 
   def get_screenlabel(self, label):
@@ -862,9 +862,6 @@ def get_preset(key, remote):
   preset = presets[key]
   return preset
 
-
-def serialize(x): return base64.urlsafe_b64encode(zlib.compress(json.dumps(x).encode("utf-8"))).decode("utf-8")
-def deserialize(x): return json.loads(zlib.decompress(base64.urlsafe_b64decode(x)).decode("utf-8"))
 
 class RPCCodec:
   @ft.singledispatch
@@ -991,29 +988,6 @@ class CommandTreeTools:
         else:          raise NotImplementedError()
       parser.add_argument(*args, **kwargs)
 
-class NestedArgumentParser(argparse.ArgumentParser):
-  def __init__(self, *args, namespace_name=None, **kwargs):
-    super().__init__(*args, **kwargs)
-    assert namespace_name is not None
-    self.namespace_name = namespace_name
-  def parse_args(self, args=None, namespace=None):
-    subnamespace = argparse.Namespace()
-    subnamespace = super().parse_args(args=args, namespace=subnamespace)
-    if namespace is None:
-      namespace = argparse.Namespace()
-    setattr(namespace, self.namespace_name, subnamespace)
-    return namespace
-  def parse_known_args(self, args=None, namespace=None):
-    subnamespace = argparse.Namespace()
-    subnamespace, arg_strings = super().parse_known_args(args=args, namespace=subnamespace)
-    if namespace is None:
-      namespace = argparse.Namespace()
-    setattr(namespace, self.namespace_name, subnamespace)
-    return namespace, arg_strings
-  @classmethod
-  def factory(cls, *args, **kwargs):
-    return ft.partial(cls, *args, **kwargs)
-
 def detour_rpc_argv(method, *args, **kwargs):
   rpc_kwargs = kwargs.pop("rpc_kwargs", dict())
   rpc_argv = RPCCodec.encode_args(*args, **rpc_kwargs)
@@ -1043,7 +1017,7 @@ def make_that_dir(path):
   path = str(path) # convert pathlib Path (which has mkdir but exist_ok is py>=3.5)
   os.makedirs(path, exist_ok=True)
 
-def dedup(xs):
+def dedup(xs): # deduplicate while maintaining order
   seen = set()
   ys = []
   for x in xs:
@@ -1074,6 +1048,8 @@ def check_output_interactive(command):
   pty.spawn(command, read)
   return "".join(output)
 
+def serialize(x): return base64.urlsafe_b64encode(zlib.compress(json.dumps(x).encode("utf-8"))).decode("utf-8")
+def deserialize(x): return json.loads(zlib.decompress(base64.urlsafe_b64decode(x)).decode("utf-8"))
 
 def random_string(length):
   import random, string
@@ -1105,6 +1081,29 @@ def unzip(tuples):
 
 def map_values(fn, mapping):
   return {k: fn(v) for k, v in mapping.items()}
+
+class NestedArgumentParser(argparse.ArgumentParser):
+  def __init__(self, *args, namespace_name=None, **kwargs):
+    super().__init__(*args, **kwargs)
+    assert namespace_name is not None
+    self.namespace_name = namespace_name
+  def parse_args(self, args=None, namespace=None):
+    subnamespace = argparse.Namespace()
+    subnamespace = super().parse_args(args=args, namespace=subnamespace)
+    if namespace is None:
+      namespace = argparse.Namespace()
+    setattr(namespace, self.namespace_name, subnamespace)
+    return namespace
+  def parse_known_args(self, args=None, namespace=None):
+    subnamespace = argparse.Namespace()
+    subnamespace, arg_strings = super().parse_known_args(args=args, namespace=subnamespace)
+    if namespace is None:
+      namespace = argparse.Namespace()
+    setattr(namespace, self.namespace_name, subnamespace)
+    return namespace, arg_strings
+  @classmethod
+  def factory(cls, *args, **kwargs):
+    return ft.partial(cls, *args, **kwargs)
 
 if not hasattr(Path, "write_text"):
   def read_text(self, encoding=None, errors=None):
