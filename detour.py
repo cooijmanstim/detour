@@ -759,14 +759,19 @@ class Database(object):
       config = json.loads(Path(path).read_text())
       if config.get("study", None) == study:
         yield config["label"]
-  def designated_labels(self, labels, ignore_nonexistent=False):
+  def designated_labels(self, labels, ignore_nonexistent=False, deduplicate=True):
     result = []
     for label in labels:
       path = self.get_rundir(label)
       if path.exists():
         result.append(label)
       else: # assume it's a study
-        result.extend(self.study_labels(label))
+        study_labels = self.study_labels(label)
+        if not study_labels and not ignore_nonexistent:
+          raise KeyError("unknown run or study", label)
+        result.extend(study_labels)
+    if deduplicate:
+      result = list(set(result))
     return result
 
   def get_screenlabel(self, label):
