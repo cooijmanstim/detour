@@ -1042,11 +1042,29 @@ def check_output_interactive(command):
   master, slave = pty.openpty()
   output = []
   def read(fd):
+    # TODO consider this opportunity to strip out RPC data from the interactive stream
     data = os.read(fd, 1024)
     output.append(data.decode("utf-8"))
     return data
-  pty.spawn(command, read)
-  return "".join(output)
+  pid, status = pty.spawn(command, read)
+  status = waitwhat(status)
+  output = "".join(output)
+  if status:
+    # NOTE output contains both stdout and stderr; we can't distinguish them
+    raise sp.CalledProcessError(status, command, output=output, stderr=None)
+  return output
+
+def waitwhat(status):
+  # pty.spawn returns whatever waitpid returns, which is
+  #   a 16-bit number, whose low byte is the signal number that killed the
+  #   process, and whose high byte is the exit status (if the signal number is
+  #   zero); the high bit of the low byte is set if a core file was produced.
+  # so pythonic!
+  # taking a page from `_handle_exitstatus` deep in `subprocess.Popen` internals:
+  if os.WIFSIGNALED(status): return -os.WTERMSIG(status)
+  elif os.WIFEXITED(status): return os.WEXITSTATUS(status)
+  elif os.WIFSTOPPED(status): return -os.WSTOPSIG(status) # this one shouldn't occur for us
+  else: raise ValueError(status)
 
 def serialize(x): return base64.urlsafe_b64encode(zlib.compress(json.dumps(x).encode("utf-8"))).decode("utf-8")
 def deserialize(x): return json.loads(zlib.decompress(base64.urlsafe_b64decode(x)).decode("utf-8"))
