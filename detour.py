@@ -92,6 +92,9 @@ class _:
   def push(*labels): do_bulk_remote(labels, "push")
   def pull(*labels): do_bulk_remote(labels, "pull")
   def purge(*labels): do_bulk_remote(labels, "purge", ignore_nonexistent=True)
+  def kill(*labels): do_bulk_remote(labels, "kill", ignore_nonexistent=True)
+  def killpurge(*labels, _kill=kill, _purge=purge):
+    _kill(*labels); _purge(*labels)
 
   def stdout(label):
     path = G.localdb.get_stdout_path(label)
@@ -160,7 +163,7 @@ def get_statuses(labels, ignore_cache=False):
     # for unterminated, figure out statuses remotely
     unterminated = [label for label in labels if not G.localdb.known_terminated(label)]
     if unterminated or ignore_cache:
-      statuses.update(remote.statusmany(unterminated))
+      statuses.update(remote.status(unterminated))
     # for terminated, figure out statuses locally
     terminated = [label for label in labels if G.localdb.known_terminated(label)]
     statuses.update((label, G.localdb.get_status(label)) for label in terminated)
@@ -344,70 +347,47 @@ class Remote(object):
     sp.check_call("bash", cwd=str(self.database.get_rundir(label)))
 
   @remotely(interactive=False)
-  def statusmany(self, labels):
-    # FIXME move this all into database?
+  def status(self, labels):
     statuses = dict()
-    job_ids = ordict()
+    label_by_jobid = ordict()
 
     for label in labels:
       if not self.database.get_rundir(label).exists():
         statuses[label] = "no remote copy"
       else:
-        job_id = self.database.get_job_id(label)
-        if job_id is None:
+        jobid = self.database.get_job_id(label)
+        if jobid is None:
           self.database.mark_lost(label)
           statuses[label] = "lost"
         else:
-          job_ids[job_id] = label
+          label_by_jobid[jobid] = label
 
-    try:
-      blob = sp.check_output(["squeue", "-O", "jobid,state,reason,timeused,timeleft", "-j", ",".join(job_ids.keys())], stderr=sp.STDOUT)
-      error = 0
-      # example output:
-      # JOBID               STATE               REASON              TIME                TIME_LEFT
-      # 11922138            PENDING             Priority            0:00                1-00:00:00
-      # 11922147            PENDING             Priority            0:00                1-00:00:00
-      # 11922157            PENDING             Priority            0:00                1-00:00:00
-      for line in blob.splitlines()[1:]:
-        line = line.decode("utf-8")
-        job_id, state, reason, timeused, timeleft = line.split()
-        statuses[job_ids[job_id]] = ordict(state=state, reason=reason, timeused=timeused, timeleft=timeleft)
-    except sp.CalledProcessError as e:
-      blob = e.output
-      error = e.returncode
-      if "Invalid job id specified" in blob.decode("utf-8"):
-        # a preliminary trial suggests this error only occurs when len(job_ids) == 1, and
-        # invalid job ids are ignored otherwise. we can ignore this error.
-        # the missing entries in statuses will be caught below.
-        pass
-      else:
-        logging.error("something went wrong in call to squeue, dropping into pdb")
-        import pdb; pdb.set_trace()
+    for jobid, status in squeue(list(label_by_jobid.keys()), fields="state reason timeused timeleft"):
+      statuses[label_by_jobid[jobid]] = status
 
-    for job_id, label in job_ids.items():
+    for jobid, label in label_by_jobid.items():
       if label not in statuses:
         # this could happen if the job has terminated, in which case the local part should
         # pull it out of the `terminated` file. however due to race conditions (the job
         # terminated in the time it took for control to arrive here) we'll take care of it.
         statuses[label] = self.database.get_status(label)
 
-    if any(label not in statuses for label in job_ids.values()):
-      logger.error("could not determine status of the following jobs:")
-      for job_id, label in job_ids.items():
-        if label not in statuses:
-          logger.error("job %s with label %s", job_id, label)
-      import pdb; pdb.set_trace()
-
+    assert set(labels) == set(statuses.keys())
     return statuses
 
-  @statusmany.locally
-  def statusmany(self, labels, call_remote):
+  @status.locally
+  def status(self, labels, call_remote):
     if not labels: return dict()
     statuses = call_remote(labels)
     for label, status in statuses.items():
       if status == "no remote copy":
         G.localdb.mark_terminated(label, "no remote copy")
     return statuses
+
+  @remotely(interactive=True)
+  def kill(self, labels):
+    jobids = list(map(self.database.get_job_id, labels))
+    sp.check_call(["scancel", *jobids])
 
   @remotely_only(interactive=True)
   def run(self, label):
@@ -855,6 +835,34 @@ def extract_exceptions(output):
   exceptions = filter(fn, exceptions)
   return exceptions
 
+def squeue(jobids, fields="state reason timeused timeleft"):
+  fields = wordlist(fields)
+  try:
+    blob = sp.check_output(["squeue",
+                            "-O", ",".join(["jobid"] + fields),
+                            "-j", ",".join(jobids)],
+                           stderr=sp.STDOUT)
+    error = 0
+    # example output: (for default fields)
+    # JOBID               STATE               REASON              TIME                TIME_LEFT
+    # 11922138            PENDING             Priority            0:00                1-00:00:00
+    # 11922147            PENDING             Priority            0:00                1-00:00:00
+    # 11922157            PENDING             Priority            0:00                1-00:00:00
+    for line in blob.splitlines()[1:]:
+      line = line.decode("utf-8")
+      jobid, *values = line.split()
+      yield jobid, dict(eqzip(fields, values))
+  except sp.CalledProcessError as e:
+    blob = e.output
+    error = e.returncode
+    if "Invalid job id specified" in blob.decode("utf-8"):
+      # a preliminary trial suggests this error only occurs when len(jobids) == 1, and
+      # invalid job ids are ignored otherwise. we ignore this error to make it consistent.
+      pass
+    else:
+      logging.error("something went wrong in call to squeue, dropping into pdb")
+      import pdb; pdb.set_trace()
+
 def get_preset(key, remote):
   key = key or "classic"
   presets = dict(light=dict(time="1:00:00", mem="4G", gres="gpu:1"),
@@ -1046,8 +1054,7 @@ def check_output_interactive(command):
     data = os.read(fd, 1024)
     output.append(data.decode("utf-8"))
     return data
-  pid, status = pty.spawn(command, read)
-  status = waitwhat(status)
+  status = waitwhat(pty.spawn(command, read))
   output = "".join(output)
   if status:
     # NOTE output contains both stdout and stderr; we can't distinguish them
@@ -1099,6 +1106,9 @@ def unzip(tuples):
 
 def map_values(fn, mapping):
   return {k: fn(v) for k, v in mapping.items()}
+
+def wordlist(s):
+  return s.split() if isinstance(s, str) else s # else assume already split
 
 class NestedArgumentParser(argparse.ArgumentParser):
   def __init__(self, *args, namespace_name=None, **kwargs):
