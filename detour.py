@@ -399,10 +399,11 @@ class Remote(object):
       job_id = os.environ["SLURM_JOB_ID"]
       self.database.set_job_id(label, job_id)
       logger.warning("detour run label %s job_id %s start %s", label, job_id, get_timestamp())
-      invocation = self.database.get_invocation(label)
+      rundir = self.database.get_rundir(label)
+      invocation = self.database.read_invocation(rundir)
       os.environ["DETOUR_LABEL"] = label # for the user program
       logger.warning("invoking %s", invocation)
-      status = sp.check_call(invocation, cwd=str(Path(self.database.get_rundir(label), "tree")))
+      status = sp.check_call(invocation, cwd=str(Path(rundir, "tree")))
     finally:
       if status is None:
         status = tb.format_exc()
@@ -629,14 +630,11 @@ class Database(object):
       config = json.loads(Path(config_path).read_text())
       yield config
 
-  def set_invocation(self, label, invocation):
-    self.get_invocation_path(label).write_text(json.dumps(invocation))
+  def write_invocation(self, rundir, invocation):
+    Path(rundir, "invocation.json").write_text(json.dumps(invocation))
 
-  def get_invocation(self, label):
-    return json.loads(self.get_invocation_path(label).read_text())
-
-  def get_invocation_path(self, label):
-    return Path(self.runsdir, label, "invocation.json")
+  def read_invocation(self, rundir):
+    return json.loads(Path(rundir, "invocation.json").read_text())
 
   def set_config(self, label, config):
     self.get_config_path(label).write_text(json.dumps(config))
@@ -708,14 +706,15 @@ class Database(object):
     # we can probably leave the output files of past runs?
 
   def package(self, *invocation, **config):
-    # NOTE: did I want to include invocation in the digest?
     # gather files and determine checksum
     with tempfile.TemporaryDirectory() as tmpdir:
-      path = Path(tmpdir, "tree")
-      sp.check_call(["rsync", "-rlzF"] + rsync_filter + ["./", str(path)])
+      rundir = Path(tmpdir, "rundir") # need a toplevel without random name so it won't affect digest
+      self.write_invocation(rundir, invocation)
+
+      sp.check_call(["rsync", "-rlzF"] + rsync_filter + ["./", str(Path(rundir, "tree"))])
       digest_output = sp.check_output(
         # (would prefer to use find -print0 and tar --null, but the latter doesn't seem to work)
-        "tar -cf - %s | sha256sum" % path,
+        "tar -cf - %s | sha256sum" % rundir,
         shell=True, cwd=tmpdir)
       # with timestamp, 4 characters (32 bits) should be plenty
       digest = digest_output.decode().splitlines()[0].split()[0][:4]
@@ -723,11 +722,12 @@ class Database(object):
       timestamp = get_timestamp()
       label = "%s_%s" % (timestamp, digest)
 
-      # create rundir and move files into place
-      shutil.move(path, Path(self.ensure_rundir(label), "tree"))
+      # move files into place
+      if Path(self.runsdir, label).exists():
+        raise ValueError("label already in use", label)
+      shutil.move(rundir, self.runsdir)
 
     config["label"] = label
-    self.set_invocation(label, invocation)
     self.set_config(label, config)
     logger.warning("invocation: %r", invocation)
     logger.warning("label: %r", label)
