@@ -77,27 +77,29 @@ class _:
     print(method, args, kwargs)
 
   # packaging and launching runs
-  def launchcmd(*invocation, remote=None, interactive=False, study=None, preset=None):
+  def launchcmd(*invocation, interactive=False, remote=None, study=None, preset=None):
     assert not G.config.on_remote
     run = G.db.package(invocation)
     alias = G.db.autoalias(run)
     run.props.study = study
     run.props.remote = remote
-    if interactive: run.remote.launch_interactive([run], preset=preset)
-    else:           run.remote.launch_batch      ([run], preset=preset)
+    run.props.preset = preset
+    if interactive: run.remote.launch_interactive([run])
+    else:           run.remote.launch_batch      ([run])
     print("launched", run.present_label)
-  def launch(*labels, preset=None, interactive=False):
+  def launch(*labels, interactive=False):
     assert not G.config.on_remote
     runs = G.db.designated_runs(labels)
     for remote, runs in G.db.by_remote(runs):
       interruptible_sleep(2) # throttle
-      if interactive: remote.launch_interactive(runs, preset=preset)
-      else:           remote.launch_batch      (runs, preset=preset)
-  def package(*invocation, remote=None, study=None):
+      if interactive: remote.launch_interactive(runs)
+      else:           remote.launch_batch      (runs)
+  def package(*invocation, remote=None, study=None, preset=None):
     assert not G.config.on_remote
     run = G.db.package(invocation)
     run.props.study = study
     run.props.remote = remote
+    run.props.preset = preset
     print(run.label)
   def autoalias(label, *, force=False):
     assert not G.config.on_remote
@@ -456,56 +458,48 @@ class Remote:
 
   # BATCH functionality
 
-  # TODO reconsider this preset forwarding thing. it's one of the reasons `config.json`
-  # used to exist. there are a few levels of run properties;
-  # constants like `study`, and variables that could change on resubmission such as `remote`.
-  # we treat `remote` as constant because hassle, and we might as well do the same for `preset`?
-  # we could store `preset` as a run prop and have a `detour setprop LABEL KEY VALUE` thing to
-  # update it before resubmit.
-  # yes do that
-
   @locally_only
-  def launch_batch(self, runs, preset=None):
+  def launch_batch(self, runs):
     self.push(runs)
-    self.submit_jobs(runs, preset=preset)
+    self.submit_jobs(runs)
 
   @remotely(interactive=False)
-  def resubmit(self, runs, preset=None):
+  def resubmit(self, runs):
     job_ids = dict()
     for run in runs:
       # clear state before call to _submit_job, not after, to avoid clearing new job_id
       run.prepare_resubmit()
       interruptible_sleep(2) # throttle
-      job_ids[run] = self._submit_batch_job(run, preset=preset)
+      job_ids[run] = self._submit_batch_job(run)
     return job_ids
 
   @resubmit.locally
-  def resubmit(self, runs, preset=None, call_remote=None):
-    job_ids = call_remote(runs, preset=preset)
+  def resubmit(self, runs, call_remote=None):
+    job_ids = call_remote(runs)
     # clear state of the jobs that the remote has launched
     for run in job_ids.keys():
       run.prepare_resubmit()
     return job_ids
 
   @remotely(interactive=False)
-  def submit_jobs(self, runs, preset=None):
+  def submit_jobs(self, runs):
     job_ids = dict()
     for run in runs:
       interruptible_sleep(2) # throttle
-      job_ids[run] = self._submit_batch_job(run, preset=preset)
+      job_ids[run] = self._submit_batch_job(run)
     return job_ids
 
 
   # INTERACTIVE functionality
   @locally_only
-  def launch_interactive(self, runs, preset=None):
+  def launch_interactive(self, runs):
     # interactive means run one by one
     for run in runs:
       self.push([run])
-      self.enter_screen(run, preset=preset)
+      self.enter_screen(run)
 
   @remotely(interactive=True)
-  def enter_screen(self, run, preset=None):
+  def enter_screen(self, run):
     mkdirp(run.rundir)
 
     inner_command = ["script", "-e", "session_%s.script" % get_timestamp()]
@@ -518,13 +512,13 @@ class Remote:
                   env=dict(TERM="xterm-color"))
 
   @enter_screen.locally
-  def enter_screen(self, run, preset=None, call_remote=None):
+  def enter_screen(self, run, call_remote=None):
     with self.synchronization(run):
-      call_remote(run, preset=preset)
+      call_remote(run)
 
   @remotely_only(interactive=True)
-  def submit_interactive_job(self, run, preset=None):
-    return self._submit_interactive_job(run, preset=preset)
+  def submit_interactive_job(self, run):
+    return self._submit_interactive_job(run)
 
   @remotely(interactive=True)
   def attach(self, run):
@@ -560,8 +554,8 @@ class REMOTES:
       "leto16", #stall
     ]
 
-    def _submit_interactive_job(self, run, preset=None):
-      preset_flags = ["--%s=%s" % item for item in get_preset(preset, self.key).items()]
+    def _submit_interactive_job(self, run):
+      preset_flags = ["--%s=%s" % item for item in get_preset(run.props.preset, self.key).items()]
       command = " ".join(detour_rpc_argv("run", run))
       sp.check_call(["srun", *preset_flags,
                      "--exclude=%s" % ",".join(self.excluded_hosts),
@@ -570,12 +564,12 @@ class REMOTES:
                      # NOTE: used to have bash -lic, but this sets the crucial CUDA_VISIBLE_DEVICES variable to the empty string
                      "bash", "-ic", 'conda activate py36; %s' % command])
 
-    def _submit_batch_job(self, run, preset=None):
+    def _submit_batch_job(self, run):
       mkdirp(run.rundir)
       command = " ".join(detour_rpc_argv("run", run))
       sbatch_flags = dict(qos="high",
                           exclude=",".join(self.excluded_hosts),
-                          **get_preset(preset, self.key))
+                          **get_preset(run.props.preset, self.key))
       sbatch_crud = "\n".join("#SBATCH --%s=%s" % item for item in sbatch_flags.items())
 
       # TODO run in $SLURMTMP if it ever matters
@@ -603,10 +597,10 @@ class REMOTES:
     host = "cedar"
     runsdir = Path("/home/cooijmat/projects/rpp-bengioy/cooijmat/detours")
 
-    def _submit_interactive_job(self, run, preset=None):
+    def _submit_interactive_job(self, run):
       # NOTE untested
       excluded_hosts = []
-      preset_flags = ["--%s=%s" % item for item in get_preset(preset, self.key).items()]
+      preset_flags = ["--%s=%s" % item for item in get_preset(run.props.preset, self.key).items()]
       command = " ".join(detour_rpc_argv("run", run))
       sp.check_call(["srun", *preset_flags,
                      "--account=rpp=bengioy",
@@ -615,12 +609,12 @@ class REMOTES:
                      # NOTE: used to have bash -lic, but this sets the crucial CUDA_VISIBLE_DEVICES variable to the empty string
                      "bash", "-ic", 'source $HOME/environment_setup.sh; %s' % command])
 
-    def _submit_batch_job(self, run, preset=None):
+    def _submit_batch_job(self, run):
       mkdirp(run.rundir)
 
       # make a script describing the job
       command = " ".join(detour_rpc_argv("run", run))
-      sbatch_crud = "\n".join("#SBATCH --%s=%s" % item for item in get_preset(preset, self.key).items())
+      sbatch_crud = "\n".join("#SBATCH --%s=%s" % item for item in get_preset(run.props.preset, self.key).items())
       # TODO run in $SLURMTMP if it ever matters
       Path(run.rundir, "sbatch.sh").write_text(textwrap.dedent("""
         #!/bin/bash
@@ -749,9 +743,8 @@ class Database(object):
     with tempfile.TemporaryDirectory() as tmpdir:
       tmp_rundir = Path(tmpdir, "rundir") # need a toplevel without random name so it won't affect digest
       mkdirp(tmp_rundir)
-      self.write_invocation(tmp_rundir, invocation)
-
       sp.check_call(["rsync", "-rlzF"] + rsync_filter + ["./", str(Path(tmp_rundir, "tree"))])
+
       digest_output = sp.check_output(
         # (would prefer to use find -print0 and tar --null, but the latter doesn't seem to work)
         "tar -cf - %s | sha256sum" % tmp_rundir,
@@ -770,7 +763,9 @@ class Database(object):
       mkdirp(self.runsdir)
       shutil.move(str(tmp_rundir), str(rundir))
 
-    return Run(label)
+    run = Run(label)
+    run.props.invocation = invocation
+    return run
 
   def study_labels(self, study):
     for path in self.runsdir.glob("*/config.json"):
