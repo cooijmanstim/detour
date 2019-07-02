@@ -49,12 +49,9 @@ G = attrdict(config=attrdict(), db=None)
 @FunctionTree
 def main(*, on_remote=None):
   try:
-    # TODO consider reinstating Local remote with localdb to simplify this
-    # could have G.remote be the Remote instance, and then on_remote might not need to be stored
-
-    G.config.update(on_remote=on_remote) # FIXME G.cofig necessary vs G.on_remote?
+    G.config.update(on_remote=on_remote)
     G.remote = make_remote(on_remote)
-    G.db = G.remote.database if on_remote else Database(".detours")
+    G.db = G.remote.database
     yield
   except Exception: # TODO was "except:"; trying to let keyboardinterrupt pass through
     tb.print_exc()
@@ -67,7 +64,7 @@ class _:
   def rpc(method, *rpc_argv):
     args, kwargs = RPCCodec.decode_args(*rpc_argv) # NOTE kwargs may include rpc_identifier
     try:
-      with Path(G.remote.database.runsdir, "detour_rpc_log").open("a") as log:
+      with Path(G.db.runsdir, "detour_rpc_log").open("a") as log:
         log.write("%s %r %r\n" % (method, args, kwargs))
     except: pass
     getattr(G.remote, method)(*args, **kwargs)
@@ -212,98 +209,6 @@ def do_single_remote(label, method):
   run, = G.db.designated_runs([label])
   getattr(run.remote, method)(run)
 
-
-class RemoteCommand:
-  def __init__(self, interactive=False):
-    self.interactive = interactive
-
-  # RemoteCommand represents a command that should be run on the remote. it abstracts
-  # away the hassles of connecting to the remote and serializing/deserializing arguments
-  # and return values. basically RPC.
-
-  # note the local part is akin to a contextmanager; it wraps around the remote part.
-  # it is given a keyword argument `call_remote` which takes care of the ssh tunnelling
-  # and calls the remote part. its signature is `result = call_remote(*args, **kwargs)`,
-  # where `result` is the return value of the remote part.
-  # note the args, kwargs and result go through serialize/deserialize so are constrained
-  # to what json can express. finally, local_fn should return its return value.
-  def locally(self, fn, name=None):
-    self.local_fn = fn
-    self.subcommand = fn.__name__ if name is None else name
-    return self
-
-  def remotely(self, fn, name=None):
-    self.remote_fn = fn
-    self.subcommand = fn.__name__ if name is None else name
-    return self
-
-  # total mindfuck courtesy of https://stackoverflow.com/a/47433786/7601527.
-  # callable objects can't decorate methods. python strikes again!
-  def __get__(self, the_self, type=None):
-    return ft.partial(self, the_self)
-
-  @staticmethod
-  def from_interactive(interactive, *args, **kwargs):
-    return RemoteCommand(interactive)
-
-  def __call__(self, remote, *args, **kwargs):
-    if not G.config.on_remote: # FIXME does on_remote have to be on some `config`?
-      # call local_fn, which will call call_remote with args & kwargs.
-      # call_remote will do the ssh roundtrip to invoke remote_fn with said args & kwargs.
-      def call_remote(*args, **kwargs):
-        return self.roundtrip(remote, self.subcommand, *args, **kwargs)
-      return self.local_fn(remote, *args, call_remote=call_remote, **kwargs)
-    else:
-      if self.interactive:
-        self.remote_fn(remote, *args, **kwargs)
-      else:
-        # non-interactive effectively means the command has a structured return
-        # value. this case is painful because ssh only gives us two channels
-        # through which the remote command can communicate back to us: the return
-        # code and the output. we serialize the structured return value and dump
-        # it in the output, labeled with an identifier.
-        rpc_identifier = kwargs.pop("rpc_identifier")
-        result = self.remote_fn(remote, *args, **kwargs)
-        print("rpc-response", rpc_identifier, serialize(result))
-
-  def roundtrip(self, remote, method, *argv, **kwargs):
-    # TODO: can avoid this if we make a local copy each time we copy to remote.
-    # then we can check against local copy. or keep track of last update using mtime.
-    detour_bin_path = os.path.realpath(sys.argv[0])
-    sp.check_call(remote.ssh_wrapper + ["scp", detour_bin_path, "%s:bin/detour" % remote.host])
-
-    if self.interactive:
-      if True:
-        # hoop-jumpery to get a motherfucking login shell. let's see how many levels of wrapping and mangling we need
-        rpc_argv = detour_rpc_argv(method, *argv, rpc_kwargs=kwargs, on_remote=remote.key)
-        thing = " ".join(rpc_argv)
-        assert "'" not in thing
-        return sp.check_call(remote.ssh_wrapper + ["ssh", "-t", remote.host, "bash -l -c '%s'" % thing])
-      else:
-        return sp.check_call(remote.ssh_wrapper + ["ssh", "-t", remote.host] +
-                             detour_rpc_argv(method, *argv, rpc_kwargs=kwargs, on_remote=remote.key))
-    else:
-      # try to maintain interactivity so we can drop into pdb in the remote code.
-      # if all goes well (i.e. no exceptions) there will be no interaction and the
-      # (serialized) return value of the remote code will be in the output,
-      # labeled with the rpc identifier. a better way to do this would be
-      # to capture only stdout and not stderr, but that is just not possible:
-      # https://stackoverflow.com/questions/34186035/can-you-fool-isatty-and-log-stdout-and-stderr-separately
-      rpc_identifier = random_string(8)
-      command = (remote.ssh_wrapper + ["ssh", "-t", remote.host] +
-                 detour_rpc_argv(method, *argv, on_remote=remote.key,
-                                 rpc_kwargs=dict(rpc_identifier=rpc_identifier, **kwargs)))
-      output = check_output_interactive(command)
-      for line in output.splitlines():
-        if line.startswith("rpc-response"):
-          parts = line.split()
-          if parts[0] == "rpc-response" and parts[1] == rpc_identifier:
-            result = parts[2]
-            break
-      else:
-        raise RuntimeError("no rpc-response in output")
-      return deserialize(result)
-
 # helper to reduce the brain damage
 def decorator_with_args(decorator):
   def uno(*args, **kwargs):
@@ -338,6 +243,7 @@ def remotely_only(fn, interactive=False):
   rc.locally(local_fn, name=fn.__name__)
   return rc
 
+@decorator_with_args
 def locally_only(fn):
   @ft.wraps(fn)
   def wfn(*args, **kwargs):
@@ -346,24 +252,26 @@ def locally_only(fn):
     return fn(*args, **kwargs)
   return wfn
 
-class Remote:
-  def __init__(self):
-    self.database = Database(self.runsdir)
+class BaseRemote:
+  @property
+  def database(self):
+    return Database(self.runsdir)
 
-  @locally_only
+class Remote(BaseRemote):
+  @locally_only()
   def pull(self, runs):
     if not runs: return
     rsync(["%s:%s" % (self.host, self.database.get_rundir(run)) for run in runs],
           G.db.runsdir, ssh_wrapper=self.ssh_wrapper)
 
-  @locally_only
+  @locally_only()
   def push(self, runs):
     if not runs: return
     rsync([run.rundir for run in runs],
           "%s:%s" % (self.host, self.database.runsdir),
           ssh_wrapper=self.ssh_wrapper)
 
-  @locally_only
+  @locally_only()
   def purge(self, runs):
     if not runs: return
     for subset in segments(runs, 100): # to break up long argument list (e.g. large study)
@@ -457,11 +365,20 @@ class Remote:
 
 
   # BATCH functionality
+  # the batch flow is launch_batch -(onto remote)-> submit_jobs -> run
 
-  @locally_only
+  @locally_only()
   def launch_batch(self, runs):
     self.push(runs)
     self.submit_jobs(runs)
+
+  @remotely(interactive=False)
+  def submit_jobs(self, runs):
+    job_ids = dict()
+    for run in runs:
+      interruptible_sleep(2) # throttle
+      job_ids[run] = self._submit_batch_job(run)
+    return job_ids
 
   @remotely(interactive=False)
   def resubmit(self, runs):
@@ -481,17 +398,10 @@ class Remote:
       run.prepare_resubmit()
     return job_ids
 
-  @remotely(interactive=False)
-  def submit_jobs(self, runs):
-    job_ids = dict()
-    for run in runs:
-      interruptible_sleep(2) # throttle
-      job_ids[run] = self._submit_batch_job(run)
-    return job_ids
-
 
   # INTERACTIVE functionality
-  @locally_only
+  # the interactive flow is launch_interactive -(onto remote)-> enter_screen -> submit_interactive_job -> run
+  @locally_only()
   def launch_interactive(self, runs):
     # interactive means run one by one
     for run in runs:
@@ -501,7 +411,6 @@ class Remote:
   @remotely(interactive=True)
   def enter_screen(self, run):
     mkdirp(run.rundir)
-
     inner_command = ["script", "-e", "session_%s.script" % get_timestamp()]
     sp.check_call(["screen", "-d", "-m", "-S", run.screenlabel] + inner_command, cwd=str(run.rundir))
     # NOTE: && exit ensures screen terminates iff the command terminated successfully.
@@ -529,14 +438,19 @@ class Remote:
     with self.synchronization(run):
       call_remote(run)
 
-
 def make_remote(key):
-  # TODO return special Local() remote if key is None
-  return REMOTES[key]() if key is not None else None
+  if key is None:
+    key = "local"
+  return REMOTES[key]()
 
 @dict
 @vars
 class REMOTES:
+  # having a dummy `local` remote may or may not simplify things down the road
+  class local(BaseRemote):
+    key = "local"
+    runsdir = Path(".detours")
+
   class mila(Remote):
     key = "mila"
     ssh_wrapper = "pshaw mila".split()
@@ -933,6 +847,97 @@ def get_preset(key, remote):
   preset = presets[key]
   return preset
 
+
+class RemoteCommand:
+  def __init__(self, interactive=False):
+    self.interactive = interactive
+
+  # RemoteCommand represents a command that should be run on the remote. it abstracts
+  # away the hassles of connecting to the remote and serializing/deserializing arguments
+  # and return values. basically RPC.
+
+  # note the local part is akin to a contextmanager; it wraps around the remote part.
+  # it is given a keyword argument `call_remote` which takes care of the ssh tunnelling
+  # and calls the remote part. its signature is `result = call_remote(*args, **kwargs)`,
+  # where `result` is the return value of the remote part.
+  # note the args, kwargs and result go through serialize/deserialize so are constrained
+  # to what json can express. finally, local_fn should return its return value.
+  def locally(self, fn, name=None):
+    self.local_fn = fn
+    self.subcommand = fn.__name__ if name is None else name
+    return self
+
+  def remotely(self, fn, name=None):
+    self.remote_fn = fn
+    self.subcommand = fn.__name__ if name is None else name
+    return self
+
+  # total mindfuck courtesy of https://stackoverflow.com/a/47433786/7601527.
+  # callable objects can't decorate methods. python strikes again!
+  def __get__(self, the_self, type=None):
+    return ft.partial(self, the_self)
+
+  @staticmethod
+  def from_interactive(interactive, *args, **kwargs):
+    return RemoteCommand(interactive)
+
+  def __call__(self, remote, *args, **kwargs):
+    if not G.config.on_remote: # FIXME does on_remote have to be on some `config`?
+      # call local_fn, which will call call_remote with args & kwargs.
+      # call_remote will do the ssh roundtrip to invoke remote_fn with said args & kwargs.
+      def call_remote(*args, **kwargs):
+        return self.roundtrip(remote, self.subcommand, *args, **kwargs)
+      return self.local_fn(remote, *args, call_remote=call_remote, **kwargs)
+    else:
+      if self.interactive:
+        self.remote_fn(remote, *args, **kwargs)
+      else:
+        # non-interactive effectively means the command has a structured return
+        # value. this case is painful because ssh only gives us two channels
+        # through which the remote command can communicate back to us: the return
+        # code and the output. we serialize the structured return value and dump
+        # it in the output, labeled with an identifier.
+        rpc_identifier = kwargs.pop("rpc_identifier")
+        result = self.remote_fn(remote, *args, **kwargs)
+        print("rpc-response", rpc_identifier, serialize(result))
+
+  def roundtrip(self, remote, method, *argv, **kwargs):
+    # TODO: can avoid this if we make a local copy each time we copy to remote.
+    # then we can check against local copy. or keep track of last update using mtime.
+    detour_bin_path = os.path.realpath(sys.argv[0])
+    sp.check_call(remote.ssh_wrapper + ["scp", detour_bin_path, "%s:bin/detour" % remote.host])
+
+    if self.interactive:
+      if True:
+        # hoop-jumpery to get a motherfucking login shell. let's see how many levels of wrapping and mangling we need
+        rpc_argv = detour_rpc_argv(method, *argv, rpc_kwargs=kwargs, on_remote=remote.key)
+        thing = " ".join(rpc_argv)
+        assert "'" not in thing
+        return sp.check_call(remote.ssh_wrapper + ["ssh", "-t", remote.host, "bash -l -c '%s'" % thing])
+      else:
+        return sp.check_call(remote.ssh_wrapper + ["ssh", "-t", remote.host] +
+                             detour_rpc_argv(method, *argv, rpc_kwargs=kwargs, on_remote=remote.key))
+    else:
+      # try to maintain interactivity so we can drop into pdb in the remote code.
+      # if all goes well (i.e. no exceptions) there will be no interaction and the
+      # (serialized) return value of the remote code will be in the output,
+      # labeled with the rpc identifier. a better way to do this would be
+      # to capture only stdout and not stderr, but that is just not possible:
+      # https://stackoverflow.com/questions/34186035/can-you-fool-isatty-and-log-stdout-and-stderr-separately
+      rpc_identifier = random_string(8)
+      command = (remote.ssh_wrapper + ["ssh", "-t", remote.host] +
+                 detour_rpc_argv(method, *argv, on_remote=remote.key,
+                                 rpc_kwargs=dict(rpc_identifier=rpc_identifier, **kwargs)))
+      output = check_output_interactive(command)
+      for line in output.splitlines():
+        if line.startswith("rpc-response"):
+          parts = line.split()
+          if parts[0] == "rpc-response" and parts[1] == rpc_identifier:
+            result = parts[2]
+            break
+      else:
+        raise RuntimeError("no rpc-response in output")
+      return deserialize(result)
 
 class RPCCodec:
   @ft.singledispatch
