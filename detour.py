@@ -415,16 +415,16 @@ class Remote(BaseRemote):
 
   @remotely(interactive=True)
   def kill(self, runs):
-    sp.check_call(["scancel", *(run.props.job_id for run in runs)])
+    sp.check_call(["scancel", *(run.props.jobid for run in runs)])
 
   @remotely_only(interactive=True)
   def run(self, run):
     sp.check_call(["hostname"])
     sp.check_call(["nvidia-smi"])
     # record job number so we can determine status later, as well as whether it got started at all
-    job_id = os.environ["SLURM_JOB_ID"]
-    run.props.job_id = job_id
-    logger.warning("detour run label %s job_id %s start %s", run.label, job_id, get_timestamp())
+    jobid = os.environ["SLURM_JOB_ID"]
+    run.props.jobid = jobid
+    logger.warning("detour run label %s jobid %s start %s", run.label, jobid, get_timestamp())
     invocation = run.props.invocation
     os.environ["DETOUR_LABEL"] = run.label # for the user program
     logger.warning("invoking %s", invocation)
@@ -464,29 +464,29 @@ class Remote(BaseRemote):
 
   @remotely(interactive=False)
   def submit_jobs(self, runs):
-    job_ids = dict()
+    jobids = dict()
     for run in runs:
       interruptible_sleep(2) # throttle
-      job_ids[run] = self._submit_batch_job(run)
-    return job_ids
+      jobids[run] = self._submit_batch_job(run)
+    return jobids
 
   @remotely(interactive=False)
   def resubmit(self, runs):
-    job_ids = dict()
+    jobids = dict()
     for run in runs:
-      # clear state before call to _submit_job, not after, to avoid clearing new job_id
+      # clear state before call to _submit_job, not after, to avoid clearing new jobid
       run.prepare_resubmit()
       interruptible_sleep(2) # throttle
-      job_ids[run] = self._submit_batch_job(run)
-    return job_ids
+      jobids[run] = self._submit_batch_job(run)
+    return jobids
 
   @resubmit.locally
   def resubmit(self, runs, call_remote=None):
-    job_ids = call_remote(runs)
+    jobids = call_remote(runs)
     # clear state of the jobs that the remote has launched
-    for run in job_ids.keys():
+    for run in jobids.keys():
       run.prepare_resubmit()
-    return job_ids
+    return jobids
 
 
   # INTERACTIVE functionality
@@ -639,9 +639,9 @@ class REMOTES:
       if not match:
         print(output)
         import pdb; pdb.set_trace()
-      job_id = match.group("id").decode("ascii")
-      run.props.job_id = job_id
-      return job_id
+      jobid = match.group("id").decode("ascii")
+      run.props.jobid = jobid
+      return jobid
 
   class cedar(Remote):
     key = "cedar"
@@ -681,9 +681,9 @@ class REMOTES:
       if not match:
         print(output)
         import pdb; pdb.set_trace()
-      job_id = match.group("id").decode("ascii")
-      run.props.job_id = job_id
-      return job_id
+      jobid = match.group("id").decode("ascii")
+      run.props.jobid = jobid
+      return jobid
 
 class Run(namedtuple("Run", "label")):
   @property
@@ -744,7 +744,7 @@ class Run(namedtuple("Run", "label")):
       logger.warning("overwriting termination file for run %s", run.viewlabel)
     self.props.terminated = context
   def prepare_resubmit(self):
-    del self.props.job_id
+    del self.props.jobid
     del self.props.terminated
     # we can probably leave the output files of past runs?
 
@@ -1325,8 +1325,8 @@ class Props:
   def Get(self, key, default=None):
     assert self._path.parent.exists()
     # auto migrate legacy
-    if key in "alias terminated job_id invocation".split():
-      filename = dict(invocation="invocation.json").get(key, key)
+    if key in "alias terminated jobid invocation".split():
+      filename = dict(invocation="invocation.json", jobid="job_id").get(key, key)
       path = Path(self._path.parent, filename)
       try: value = path.read_text()
       except FileNotFoundError: pass
