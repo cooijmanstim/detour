@@ -115,11 +115,11 @@ class _:
   @props.add_children
   class _:
     def get(label, *keys):
-      run, = G.db.designated_runs([label])
+      run = G.db.designated_run(label)
       for key, value in run.props: # TODO pprint as dict?
         print(key, value)
     def set(label, key, value):
-      run, = G.db.designated_runs([label])
+      run = G.db.designated_run(label)
       run.props[key] = value
 
   def visit  (label): do_single_remote(label, "visit")
@@ -132,7 +132,7 @@ class _:
     _kill(*labels); _purge(*labels)
 
   def stdout(label):
-    run, = G.db.designated_runs([label])
+    run = G.db.designated_run(label)
     path = run.get_output_path()
     if not path:
       logger.warning("no output found for %s", run.labelview)
@@ -193,13 +193,9 @@ def get_statuses(runs, ignore_cache=False):
       # pull all labels whether locally considered terminated or not
       remote.pull(runs)
     else:
-      unterminated = [run for run in runs if not run.known_terminated]
-      if unterminated: # TODO move this check into remote.pull
-        remote.pull(unterminated)
+      remote.pull([run for run in runs if not run.known_terminated])
     # for unterminated, figure out statuses remotely
-    unterminated = [run for run in runs if not run.known_terminated]
-    if unterminated or ignore_cache: # FIXME condition seems wrong
-      statuses.update(remote.status(unterminated))
+    statuses.update(remote.status([run for run in runs if not run.known_terminated]))
     # for terminated, figure out statuses locally
     terminated = [run for run in runs if run.known_terminated]
     statuses.update((run, run.get_status()) for run in terminated)
@@ -213,7 +209,7 @@ def do_bulk_remote(labels, method, ignore_nonexistent=False):
     getattr(remote, method)(runs)
 def do_single_remote(label, method):
   assert not G.config.on_remote
-  run, = G.db.designated_runs([label])
+  run = G.db.designated_run(label)
   getattr(run.remote, method)(run)
 
 class RemoteCommand:
@@ -250,7 +246,7 @@ class RemoteCommand:
     return RemoteCommand(interactive)
 
   def __call__(self, remote, *args, **kwargs):
-    if not G.config.on_remote: # FIXME does on_remote have to be on some `config`?
+    if not G.config.on_remote:
       # call local_fn, which will call call_remote with args & kwargs.
       # call_remote will do the ssh roundtrip to invoke remote_fn with said args & kwargs.
       def call_remote(*args, **kwargs):
@@ -364,14 +360,14 @@ class Remote(BaseRemote):
   @locally_only()
   def purge(self, runs):
     if not runs: return
+    aliases = [run.props.alias for run in runs if run.rundir.exists()]
     for subset in segments(runs, 100): # to break up long argument list (e.g. large study)
       sp.check_call(self.ssh_wrapper + ["ssh", self.host] +
                     # -f because we don't care if any don't exist
                     ["rm", "-rf"] + [str(run.rundir) for run in subset])
       sp.check_call(["rm", "-rf"] + [str(run.rundir) for run in subset])
-    for run in runs:
-      if run.props.alias:
-        self.database.unbind_alias(run.props.alias)
+    for alias in aliases:
+      G.db.unbind_alias(alias)
 
   @remotely(interactive=True)
   def visit(self, run):
@@ -380,6 +376,7 @@ class Remote(BaseRemote):
   @remotely(interactive=False)
   def status(self, runs):
     statuses = dict()
+    if not runs: return statuses
     run_by_jobid = ordict()
 
     for run in runs:
@@ -508,7 +505,7 @@ class Remote(BaseRemote):
     sp.check_call(["screen", "-d", "-m", "-S", run.screenlabel] + inner_command, cwd=str(run.rundir))
     # NOTE: && exit ensures screen terminates iff the command terminated successfully.
     sp.check_call(["screen", "-S", run.screenlabel, "-p", "0", "-X", "stuff",
-                   "%s && exit^M" % " ".join(detour_rpc_argv("submit_interactive_job", run.run))],
+                   "%s && exit^M" % " ".join(detour_rpc_argv("submit_interactive_job", run))],
                   cwd=str(run.rundir))
     sp.check_call(["screen", "-x", run.screenlabel],
                   env=dict(TERM="xterm-color"))
@@ -542,12 +539,60 @@ class REMOTES:
   # having a dummy `local` remote may or may not simplify things down the road
   class local(BaseRemote):
     key = "local"
-    runsdir = Path(".detours")
+    # this keeps a separate database per project, requires that detour is run from that project's root directory
+    runsdir = Path(Path.cwd(), ".detours")
+
+    def pull(self, runs): pass
+    def push(self, runs): pass
+    def purge(self, runs):
+      if not runs: return
+      aliases = [run.props.alias for run in runs if run.rundir.exists()]
+      for subset in segments(runs, 100): # to break up long argument list (e.g. large study)
+        sp.check_call(["rm", "-r"] + [str(run.rundir) for run in subset if run.rundir.exists()])
+      for alias in aliases:
+        G.db.unbind_alias(alias)
+    def visit(self, run): sp.check_call("bash", cwd=str(run.rundir))
+    def status(self, runs): return {run: run.get_status() for run in runs}
+    def kill(self, runs): raise NotImplementedError()
+    def run(self, run):
+      invocation = run.props.invocation
+      os.environ["DETOUR_LABEL"] = run.label # for the user program
+      print(os.environ["PATH"])
+      logger.warning("invoking %s", invocation)
+      try:
+        status = sp.check_call(invocation, cwd=str(Path(run.rundir, "tree")))
+      except:
+        status = tb.format_exc()
+        raise
+      finally:
+        run.props.terminated = str(status)
+    def launch_interactive(self, runs):
+      for run in runs:
+        self.enter_screen(run)
+    def enter_screen(self, run):
+      mkdirp(run.rundir)
+      inner_command = ["script", "-e", "session_%s.script" % get_timestamp()]
+      sp.check_call(["screen", "-d", "-m", "-S", run.screenlabel] + inner_command, cwd=str(run.rundir))
+      sp.check_call(["screen", "-S", run.screenlabel, "-p", "0", "-X", "stuff",
+                     "conda activate py3^M"],
+                    cwd=str(run.rundir))
+      # NOTE: && exit ensures screen terminates iff the command terminated successfully.
+      # FIXME somehow by the time we get to `run` the PATH is modified again with ~/bin and ~/.local/bin in front, so .bashrc must be sourced
+      # FIXME figure this out later -_________________________#___________________________-------------
+      # FIXME figured it out by putting ~/bin and friends only in .profile for now
+      sp.check_call(["screen", "-S", run.screenlabel, "-p", "0", "-X", "stuff",
+                    "%s && exit^M" % " ".join(detour_rpc_argv("run", run))],
+                    cwd=str(run.rundir))
+      sp.check_call(["screen", "-x", run.screenlabel],
+                    env=dict(TERM="xterm-color"))
+    def attach(self, run):
+      sp.check_call(["screen", "-x", run.screenlabel])
+
 
   class mila(Remote):
     key = "mila"
     ssh_wrapper = "pshaw mila".split()
-    host = "mila2"
+    host = "mila1"
     runsdir = Path("/network/tmp1/cooijmat/detours")
 
     excluded_hosts = [
@@ -669,7 +714,7 @@ class Run(namedtuple("Run", "label")):
 
   @property
   def screenlabel(self):
-    return "detour_%s" % label
+    return "detour_%s" % self.label
   @property
   def labelview(self):
     return G.db.present_label(self)
@@ -775,23 +820,19 @@ class Database(object):
     return run
 
   def study_labels(self, study):
-    for path in self.runsdir.glob("*/config.json"):
-      config = json.loads(Path(path).read_text())
-      if config.get("study", None) == study:
-        yield config["label"]
-    # TODO this breaks abstraction, but one glob ought to be faster than iterating over self.get_runs()?
-    for path in self.runsdir.glob("*/props/study"):
-      study = json.loads(path.read_text())
-      if study == study:
-        rundir = path.parent.parent
-        if not rundir.is_symlink():
-          yield rundir.name
+    for run in self.get_runs():
+      if run.rundir.exists() and run.props.study == study:
+        yield run.label
   def designated_labels(self, labels, ignore_nonexistent=False, deduplicate=True):
     result = []
     for label in labels:
       path = Path(self.runsdir, label)
       if path.is_symlink(): # an alias
-        result.append(self.resolve_alias(path.name).label)
+        run = self.resolve_alias(path.name)
+        if run:
+          result.append(run.label)
+        elif not ignore_nonexistent:
+          raise RuntimeError("broken alias", path.name)
       elif path.exists(): # assume rundir, which has label as its name
         assert path.is_dir()
         result.append(label)
@@ -806,6 +847,15 @@ class Database(object):
     return result
   def designated_runs(self, labels, ignore_nonexistent=False, deduplicate=True):
     return list(map(Run, self.designated_labels(labels)))
+  def designated_run(self, label):
+    runs = self.designated_runs([label])
+    if not runs:
+      print(self.runsdir)
+      raise KeyError("unknown run", label)
+    if len(runs) > 1:
+      # this won't happen unless `label` is the name of a study
+      raise ValueError("multiple runs associated with", label)
+    return runs[0]
 
   def present_label(self, run):
     # NOTE alias symbolic links aren't available on remote... another reason to rethink this
@@ -861,12 +911,15 @@ class Database(object):
     run.props.alias = alias
   def unbind_alias(self, alias):
     run = self.resolve_alias(alias)
-    del run.props.alias
+    if run:
+      del run.props.alias
     Path(self.runsdir, alias).unlink()
   def resolve_alias(self, alias):
     alias_path = Path(self.runsdir, alias)
     label = alias_path.resolve().name # TODO fragile?
     run = Run(label)
+    if not run.rundir.exists():
+      return None
     if run.props.alias != alias:
       raise RuntimeError("alias inconsistency: %s is symlinked to %s, which points back to %s"
                          % (alias, alias_path.resolve(), run.props.alias))
@@ -1082,6 +1135,8 @@ def detour_argv(*argv, **config):
     if isinstance(value, bool): # sigh
       if value:
         flags.append("--%s" % key)
+    elif value is None:
+      pass
     else:
       flags.append("--%s=%s" % (key, value))
   return ["detour"] + flags + list(argv)
@@ -1147,9 +1202,7 @@ def waitwhat(status):
 
 # we want serialization to be able to handle our objects; these functions handle
 # flattening/reinstantiating our objects into jsonable types.
-
 tupletypes = dict(tuple=tuple, Run=Run) # hard to do this generally and safely, so whitelist
-
 jsonize_types = dict(
   list=(list,
         lambda xs: list(map(jsonize, xs)),
@@ -1162,7 +1215,6 @@ jsonize_types = dict(
   dict=(dict,
         lambda xs: [(jsonize(k), jsonize(v)) for k, v in xs.items()],
         lambda xs: {dejsonize(k): dejsonize(v) for k, v in xs}))
-
 def jsonize(x):
   # regenerate `singledispatch` table on every call to stay in sync with
   # `jsonize_types` if it ever changes. not too worried about any performance
@@ -1271,6 +1323,7 @@ class Props:
   def Set(self, key, value):
     Path(mkdirp(self._path), key).write_text(json.dumps(value))
   def Get(self, key, default=None):
+    assert self._path.parent.exists()
     # auto migrate legacy
     if key in "alias terminated job_id invocation".split():
       filename = dict(invocation="invocation.json").get(key, key)
