@@ -686,24 +686,15 @@ class REMOTES:
       return jobid
 
 class Run(namedtuple("Run", "label")):
-  @property
-  def rundir(self):
-    return Path(G.db.runsdir, self.label)
+  rundir = property(lambda self: Path(G.db.runsdir, self.label))
+  remote = property(lambda self: make_remote(self.props.remote))
+  screenlabel = property(lambda self: f"detour_{self.label}")
+  labelview = property(lambda self: G.db.present_label(self))
 
   @property
   def props(self):
+    assert self.rundir.exists()
     return Props(Path(self.rundir, "props"))
-
-  @property
-  def remote(self):
-    return make_remote(self.props.remote)
-
-  @property
-  def screenlabel(self):
-    return "detour_%s" % self.label
-  @property
-  def labelview(self):
-    return G.db.present_label(self)
 
   def get_output_path(self):
     for pattern in "session*.script slurm-*.out".split():
