@@ -695,20 +695,6 @@ class Run(namedtuple("Run", "label")):
     return Props(Path(self.rundir, "props"))
 
   @property
-  def config(self):
-    # legacy; return whatever used to be stored in `config.json`
-    config_path = Path(self.rundir, "config.json")
-    if config_path.exists():
-      # migrate config.json files to props
-      config = json.loads(config_path.read_text())
-      for key, value in config:
-        self.props[key] = value
-    else:
-      return dict(study=self.props.study,
-                  remote=self.props.remote,
-                  label=self.props.label)
-
-  @property
   def remote(self):
     return make_remote(self.props.remote)
 
@@ -1324,26 +1310,6 @@ class Props:
     Path(mkdirp(self._path), key).write_text(json.dumps(value))
   def Get(self, key, default=None):
     assert self._path.parent.exists()
-    # auto migrate legacy
-    if key in "alias terminated jobid invocation".split():
-      filename = dict(invocation="invocation.json", jobid="job_id").get(key, key)
-      path = Path(self._path.parent, filename)
-      try: value = path.read_text()
-      except FileNotFoundError: pass
-      else:
-        value = dict(invocation=json.loads).get(key, lambda s: s)(value)
-        self[key] = value
-        path.unlink()
-    if key in "label study remote".split():
-      path = Path(self._path.parent, "config.json")
-      try:
-        config = json.loads(path.read_text())
-      except FileNotFoundError: pass
-      else:
-        for key_, value in config.items():
-          self[key_] = value
-        path.unlink()
-
     try: return json.loads(Path(self._path, key).read_text())
     except FileNotFoundError:
       if default is NODEFAULT: raise
