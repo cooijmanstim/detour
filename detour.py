@@ -361,13 +361,16 @@ class Remote(BaseRemote):
   def purge(self, runs):
     if not runs: return
     aliases = [run.props.alias for run in runs if run.rundir.exists()]
-    for subset in segments(runs, 100): # to break up long argument list (e.g. large study)
-      sp.check_call(self.ssh_wrapper + ["ssh", self.host] +
-                    # -f because we don't care if any don't exist
-                    ["rm", "-rf"] + [str(run.rundir) for run in subset])
-      sp.check_call(["rm", "-rf"] + [str(run.rundir) for run in subset])
-    for alias in aliases:
-      G.db.unbind_alias(alias)
+    try:
+      for subset in segments(runs, 100): # to break up long argument list (e.g. large study)
+        sp.check_call(self.ssh_wrapper + ["ssh", self.host] +
+                      # -f because we don't care if any don't exist
+                      ["rm", "-rf"] + [str(run.rundir) for run in subset])
+        sp.check_call(["rm", "-rf"] + [str(run.rundir) for run in subset])
+    finally:
+      for alias in aliases:
+        if alias is not None:
+          G.db.gc_alias(alias)
 
   @remotely(interactive=True)
   def visit(self, run):
@@ -533,6 +536,14 @@ def make_remote(key):
     key = "local"
   return REMOTES[key]()
 
+def find_dotdetours(path):
+  for ancestor in [path, *path.parents]:
+    dotdetours = ancestor / ".detours"
+    if dotdetours.exists():
+      return dotdetours
+  else:
+    raise RuntimeError("no .detours up from f{path}")
+
 @dict
 @vars
 class REMOTES:
@@ -540,17 +551,20 @@ class REMOTES:
   class local(BaseRemote):
     key = "local"
     # this keeps a separate database per project, requires that detour is run from that project's root directory
-    runsdir = Path(Path.cwd(), ".detours")
+    runsdir = find_dotdetours(Path.cwd())
 
     def pull(self, runs): pass
     def push(self, runs): pass
     def purge(self, runs):
       if not runs: return
       aliases = [run.props.alias for run in runs if run.rundir.exists()]
-      for subset in segments(runs, 100): # to break up long argument list (e.g. large study)
-        sp.check_call(["rm", "-r"] + [str(run.rundir) for run in subset if run.rundir.exists()])
-      for alias in aliases:
-        G.db.unbind_alias(alias)
+      try:
+        for subset in segments(runs, 100): # to break up long argument list (e.g. large study)
+          sp.check_call(["rm", "-r"] + [str(run.rundir) for run in subset if run.rundir.exists()])
+      finally:
+        for alias in aliases:
+          if alias is not None:
+            G.db.gc_alias(alias)
     def visit(self, run): sp.check_call("bash", cwd=str(run.rundir))
     def status(self, runs): return {run: run.get_status() for run in runs}
     def kill(self, runs): raise NotImplementedError()
@@ -588,11 +602,10 @@ class REMOTES:
     def attach(self, run):
       sp.check_call(["screen", "-x", run.screenlabel])
 
-
   class mila(Remote):
     key = "mila"
+    host = "mila"
     ssh_wrapper = "pshaw mila".split()
-    host = "mila1"
     runsdir = Path("/network/tmp1/cooijmat/detours")
 
     excluded_hosts = [
@@ -891,6 +904,10 @@ class Database(object):
     if run:
       del run.props.alias
     Path(self.runsdir, alias).unlink()
+  def gc_alias(self, alias):
+    run = self.resolve_alias(alias)
+    if not run:
+      self.unbind_alias(alias)
   def resolve_alias(self, alias):
     alias_path = Path(self.runsdir, alias)
     label = alias_path.resolve().name # TODO fragile?
