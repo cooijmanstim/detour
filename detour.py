@@ -183,6 +183,13 @@ class _:
         for run in runs:
           print("  ", run.labelview, run.props.remote, db.get_total_size([run]))
 
+  def squeue(remote):
+    remote = make_remote(remote)
+    remote.bang("squeue -u $USER")
+
+  def bang(remote, cmd):
+    remote = make_remote(remote)
+    remote.bang(cmd)
 
 def get_statuses(runs, ignore_cache=False):
   assert not G.config.on_remote
@@ -272,15 +279,7 @@ class RemoteCommand:
     sp.check_call(remote.ssh_wrapper + ["scp", detour_bin_path, "%s:bin/detour" % remote.host])
 
     if self.interactive:
-      if True:
-        # hoop-jumpery to get a motherfucking login shell. let's see how many levels of wrapping and mangling we need
-        rpc_argv = detour_rpc_argv(method, *argv, rpc_kwargs=kwargs, on_remote=remote.key)
-        thing = " ".join(rpc_argv)
-        assert "'" not in thing
-        return sp.check_call(remote.ssh_wrapper + ["ssh", "-t", remote.host, "bash -l -c '%s'" % thing])
-      else:
-        return sp.check_call(remote.ssh_wrapper + ["ssh", "-t", remote.host] +
-                             detour_rpc_argv(method, *argv, rpc_kwargs=kwargs, on_remote=remote.key))
+      return sp.check_call(self.get_ssh_incantation(remote, method, argv, kwargs, on_remote=remote.key))
     else:
       # try to maintain interactivity so we can drop into pdb in the remote code.
       # if all goes well (i.e. no exceptions) there will be no interaction and the
@@ -289,9 +288,9 @@ class RemoteCommand:
       # to capture only stdout and not stderr, but that is just not possible:
       # https://stackoverflow.com/questions/34186035/can-you-fool-isatty-and-log-stdout-and-stderr-separately
       rpc_identifier = random_string(8)
-      command = (remote.ssh_wrapper + ["ssh", "-t", remote.host] +
-                 detour_rpc_argv(method, *argv, on_remote=remote.key,
-                                 rpc_kwargs=dict(rpc_identifier=rpc_identifier, **kwargs)))
+      command = self.get_ssh_incantation(
+        remote, method, argv, {"rpc_identifier": rpc_identifier, **kwargs},
+        on_remote=remote.key)
       output = check_output_interactive(command)
       for line in output.splitlines():
         if line.startswith("rpc-response"):
@@ -302,6 +301,16 @@ class RemoteCommand:
       else:
         raise RuntimeError("no rpc-response in output")
       return deserialize(result)
+
+  def get_ssh_incantation(self, remote, method, argv, kwargs, **flags):
+    rpc_argv = detour_rpc_argv(method, *argv, rpc_kwargs=kwargs, **flags)
+    if True:
+      # hoop-jumpery to get a motherfucking login shell. let's see how many levels of wrapping and mangling we need
+      thing = " ".join(rpc_argv)
+      assert "'" not in thing
+      return remote.ssh_wrapper + ["ssh", "-t", remote.host, "bash -l -c '%s'" % thing]
+    else:
+      return remote.ssh_wrapper + ["ssh", "-t", remote.host] + rpc_argv
 
 # decorator to define a two-stage command
 @decorator_with_args
@@ -344,6 +353,10 @@ class BaseRemote:
     return Database(self.runsdir)
 
 class Remote(BaseRemote):
+  @locally_only()
+  def bang(self, cmd):
+    return sp.call(self.ssh_wrapper + ["ssh", self.host, cmd])
+
   @locally_only()
   def pull(self, runs):
     if not runs: return
