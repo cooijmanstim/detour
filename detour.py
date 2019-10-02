@@ -71,7 +71,7 @@ class _:
   def rpc(method, *rpc_argv):
     args, kwargs = RPCCodec.decode_args(*rpc_argv) # NOTE kwargs may include rpc_identifier
     try:
-      with Path(G.db.runsdir, "detour_rpc_log").open("a") as log:
+      with Path(G.db.runsdir, ".detour_rpc_log").open("a") as log:
         log.write("%s %r %r\n" % (method, args, kwargs))
     except: pass
     getattr(G.remote, method)(*args, **kwargs)
@@ -90,7 +90,7 @@ class _:
     run.props.preset = preset
     if interactive: run.remote.launch_interactive([run])
     else:           run.remote.launch_batch      ([run])
-    print("launched", run.present_label)
+    print("launched", run.labelview)
   def launch(*labels, interactive=False):
     assert not G.config.on_remote
     runs = G.db.designated_runs(labels)
@@ -555,7 +555,7 @@ def find_dotdetours(path):
     if dotdetours.exists():
       return dotdetours
   else:
-    raise RuntimeError("no .detours up from f{path}")
+    raise RuntimeError(f"no .detours up from {path}")
 
 @dict
 @vars
@@ -564,7 +564,7 @@ class REMOTES:
   class local(BaseRemote):
     key = "local"
     # this keeps a separate database per project, requires that detour is run from that project's root directory
-    runsdir = find_dotdetours(Path.cwd())
+    runsdir = property(lambda self: find_dotdetours(Path.cwd()))
 
     def pull(self, runs): pass
     def push(self, runs): pass
@@ -873,7 +873,10 @@ class Database(object):
     # TODO this redundancy is kinda painful to maintain. can we do better?
     # should get_alias just figure out the alias from links pointing to it?
     # that seems like a lot of work...
-    assert self.resolve_alias(alias) == run
+    # FIXME aliases should be stored in env
+    if not self.resolve_alias(alias) == run:
+      del run.props["alias"]
+      return run.label
 
     return "%s (%s)" % (run.label, alias)
 
