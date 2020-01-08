@@ -81,13 +81,14 @@ class _:
     print(method, args, kwargs)
 
   # packaging and launching runs
-  def launchcmd(*invocation, interactive=False, remote=None, study=None, preset=None):
+  def launchcmd(*invocation, interactive=False, remote=None, study=None, preset=None, condaenv="py36"):
     assert not G.config.on_remote
     run = G.db.package(invocation)
     alias = G.db.autoalias(run)
     run.props.study = study
     run.props.remote = remote
     run.props.preset = preset
+    run.props.condaenv = condaenv
     if interactive: run.remote.launch_interactive([run])
     else:           run.remote.launch_batch      ([run])
     print("launched", run.labelview)
@@ -98,12 +99,13 @@ class _:
       interruptible_sleep(2) # throttle
       if interactive: remote.launch_interactive(runs)
       else:           remote.launch_batch      (runs)
-  def package(*invocation, remote=None, study=None, preset=None):
+  def package(*invocation, remote=None, study=None, preset=None, condaenv="py36"):
     assert not G.config.on_remote
     run = G.db.package(invocation)
     run.props.study = study
     run.props.remote = remote
     run.props.preset = preset
+    run.props.condaenv = condaenv
     print(run.label)
   def autoalias(label, *, force=False):
     assert not G.config.on_remote
@@ -150,7 +152,14 @@ class _:
       print(len(runs), "runs:", status)
       if verbose:
         for run in runs:
-          print("  ", run.labelview)
+          print("  ", run.labelview, run.props.hostname)
+  def recent(n=5):
+    runs = G.db.get_runs()
+    runs = sorted(runs, key=lambda run: run.rundir)
+    latest_runs = runs[-n:]
+    for run in latest_runs:
+      print(run.labelview)
+      print("    ", run.props.invocation)
 
   def resubmit(*labels):
     runs = G.db.designated_runs(labels)
@@ -435,7 +444,8 @@ class Remote(BaseRemote):
 
   @remotely_only(interactive=True)
   def run(self, run):
-    sp.check_call(["hostname"])
+    run.props.hostname = sp.check_output(["hostname"]).decode("utf-8").strip()
+    print(run.props.hostname)
     sp.check_call(["nvidia-smi"])
     # record job number so we can determine status later, as well as whether it got started at all
     jobid = os.environ["SLURM_JOB_ID"]
@@ -461,13 +471,18 @@ class Remote(BaseRemote):
 
   @contextlib.contextmanager
   def synchronization(self, run):
-    synchronizer = sp.Popen(detour_rpc_argv("synchronizing", run),
-                            stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
     yield
-    synchronizer.terminate()
-    synchronizer.wait()
-    if not run.known_terminated:
-      self.pull([run])
+    self.pull([run])
+
+    # background sync disabled because it serves no purpose currently
+    if False:
+      synchronizer = sp.Popen(detour_rpc_argv("synchronizing", run),
+                              stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+      yield
+      synchronizer.terminate()
+      synchronizer.wait()
+      if not run.known_terminated:
+        self.pull([run])
 
 
   # BATCH functionality
@@ -601,7 +616,10 @@ class REMOTES:
       inner_command = ["script", "-e", "session_%s.script" % get_timestamp()]
       sp.check_call(["screen", "-d", "-m", "-S", run.screenlabel] + inner_command, cwd=str(run.rundir))
       sp.check_call(["screen", "-S", run.screenlabel, "-p", "0", "-X", "stuff",
-                     "conda activate py3^M"],
+                     f"conda deactivate; conda activate {run.props.condaenv}^M"],
+                    cwd=str(run.rundir))
+      sp.check_call(["screen", "-S", run.screenlabel, "-p", "0", "-X", "stuff",
+                     "which python^M"],
                     cwd=str(run.rundir))
       # NOTE: && exit ensures screen terminates iff the command terminated successfully.
       # FIXME somehow by the time we get to `run` the PATH is modified again with ~/bin and ~/.local/bin in front, so .bashrc must be sourced
@@ -625,27 +643,30 @@ class REMOTES:
       # TODO figure out if we need to exclude anything. mila00/01 don't exist anymore
       #"mila00", # requires nvidia acknowledgement
       #"mila01", # requires nvidia acknowledgement
-      "leto08", # consistently no devices found
-      "instinct1", # broken in many ways?
-      "eos19", # stall
-      "eos15", # something or other
-      "leto16", #stall
+      "leto21", # libdevice
+      "leto23", # libdevice
+      "leto31", # libdevice
+      "leto32", # libdevice
+      "bart14", # libdevice
     ]
 
     def _submit_interactive_job(self, run):
       preset_flags = ["--%s=%s" % item for item in get_preset(run.props.preset, self.key).items()]
+      condacmd = f"conda activate {run.props.condaenv}"
       command = " ".join(detour_rpc_argv("run", run))
+      the_thing = ";".join(["module load cuda/10.1/cudnn/7.6", condacmd, command])
       sp.check_call(["srun", *preset_flags,
                      "--exclude=%s" % ",".join(self.excluded_hosts),
-                     "--qos=unkillable",
+                     "--partition=unkillable",
                      "--pty",
                      # NOTE: used to have bash -lic, but this sets the crucial CUDA_VISIBLE_DEVICES variable to the empty string
-                     "bash", "-ic", 'conda activate py36; %s' % command])
+                     "bash", "-ic", the_thing])
 
     def _submit_batch_job(self, run):
       mkdirp(run.rundir)
+      condacmd = f"conda activate {run.props.condaenv}"
       command = " ".join(detour_rpc_argv("run", run))
-      sbatch_flags = dict(qos="high",
+      sbatch_flags = dict(partition="high",
                           exclude=",".join(self.excluded_hosts),
                           **get_preset(run.props.preset, self.key))
       sbatch_crud = "\n".join("#SBATCH --%s=%s" % item for item in sbatch_flags.items())
@@ -656,9 +677,10 @@ class REMOTES:
         %s
         #set -e
         source ~/.bashrc
-        conda activate py36
+        module load cuda/10.1/cudnn/7.6
         %s
-      """ % (sbatch_crud, command)).strip())
+        %s
+      """ % (sbatch_crud, condacmd, command)).strip())
 
       output = sp.check_output(["sbatch", "sbatch.sh"], cwd=str(run.rundir))
       match = re.match(rb"\s*Submitted\s*batch\s*job\s*(?P<id>[0-9]+)\s*", output)
@@ -983,6 +1005,7 @@ def squeue(jobids, fields="state reason timeused timeleft"):
     # 11922157            PENDING             Priority            0:00                1-00:00:00
     for line in blob.splitlines()[1:]:
       line = line.decode("utf-8")
+      # FIXME the "reason" field may have whitespace
       jobid, *values = line.split()
       yield jobid, dict(eqzip(fields, values))
   except sp.CalledProcessError as e:
