@@ -643,17 +643,22 @@ class REMOTES:
       # TODO figure out if we need to exclude anything. mila00/01 don't exist anymore
       #"mila00", # requires nvidia acknowledgement
       #"mila01", # requires nvidia acknowledgement
-      "leto21", # libdevice
-      "leto23", # libdevice
-      "leto31", # libdevice
-      "leto32", # libdevice
-      "bart14", # libdevice
+      #"leto21", # libdevice
+      #"leto23", # libdevice
+      #"leto31", # libdevice
+      #"leto32", # libdevice
+      #"leto11", # libdevice
+      #"bart14", # libdevice
+      "leto36", # cuda 10.1 too new for driver version 410.78
+      "power91", # crazy cpu machine
+      "power92", # crazy cpu machine
     ]
 
     def _submit_interactive_job(self, run):
       preset_flags = ["--%s=%s" % item for item in get_preset(run.props.preset, self.key).items()]
       condacmd = f"conda activate {run.props.condaenv}"
       command = " ".join(detour_rpc_argv("run", run))
+      command = f"""XLA_FLAGS="--xla_gpu_cuda_data_dir=/ai/apps/x86_64/cuda/10.1" {command}"""
       the_thing = ";".join(["module load cuda/10.1/cudnn/7.6", condacmd, command])
       sp.check_call(["srun", *preset_flags,
                      "--exclude=%s" % ",".join(self.excluded_hosts),
@@ -678,7 +683,9 @@ class REMOTES:
         #set -e
         source ~/.bashrc
         module load cuda/10.1/cudnn/7.6
+        export XLA_FLAGS="--xla_gpu_cuda_data_dir=/ai/apps/x86_64/cuda/10.1"
         %s
+        env | grep -i cuda
         %s
       """ % (sbatch_crud, condacmd, command)).strip())
 
@@ -1021,8 +1028,15 @@ def squeue(jobids, fields="state reason timeused timeleft"):
 
 def get_preset(key, remote):
   key = key or "classic"
-  presets = dict(light=dict(time="1:00:00", mem="4G", gres="gpu:1"),
-                 classic=dict(time="23:59:59", mem="16G", gres="gpu:1"))
+  gpu_crud = dict(gres="gpu:titanx:1")#, constraint="x86_64&(12gb|16gb|24gb)")
+  presets = dict(
+    light=dict(time="1:00:00", mem="12G", **gpu_crud),
+    classic=dict(time="23:59:59", mem="32G", **gpu_crud),
+  )
+  presets["24h16gb"] = dict(time="23:59:59", mem="16G", **gpu_crud)
+  presets["8h16gb"] = dict(time="8:00:00", mem="16G", **gpu_crud)
+  presets["8h8gb"] = dict(time="8:00:00", mem="8G", **gpu_crud)
+  presets["4h8gb"] = dict(time="4:00:00", mem="8G", **gpu_crud)
   preset = presets[key]
   return preset
 
