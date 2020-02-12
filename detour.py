@@ -42,6 +42,7 @@ logger.setLevel(logging.INFO)
 # hidden files and __pycache__ and notebooks
 rsync_filter = """
   --include .d2filter
+  --include .d2rc
   --exclude .*
   --exclude __pycache__
   --exclude *.npz*-numpy.npy
@@ -81,14 +82,13 @@ class _:
     print(method, args, kwargs)
 
   # packaging and launching runs
-  def launchcmd(*invocation, interactive=False, remote=None, study=None, preset=None, condaenv="py36"):
+  def launchcmd(*invocation, interactive=False, remote=None, study=None, preset=None):
     assert not G.config.on_remote
     run = G.db.package(invocation)
     alias = G.db.autoalias(run)
     run.props.study = study
     run.props.remote = remote
     run.props.preset = preset
-    run.props.condaenv = condaenv
     if interactive: run.remote.launch_interactive([run])
     else:           run.remote.launch_batch      ([run])
     print("launched", run.labelview)
@@ -99,13 +99,12 @@ class _:
       interruptible_sleep(2) # throttle
       if interactive: remote.launch_interactive(runs)
       else:           remote.launch_batch      (runs)
-  def package(*invocation, remote=None, study=None, preset=None, condaenv="py36"):
+  def package(*invocation, remote=None, study=None, preset=None):
     assert not G.config.on_remote
     run = G.db.package(invocation)
     run.props.study = study
     run.props.remote = remote
     run.props.preset = preset
-    run.props.condaenv = condaenv
     print(run.label)
   def autoalias(label, *, force=False):
     assert not G.config.on_remote
@@ -450,12 +449,20 @@ class Remote(BaseRemote):
     # record job number so we can determine status later, as well as whether it got started at all
     jobid = os.environ["SLURM_JOB_ID"]
     run.props.jobid = jobid
-    logger.warning("detour run label %s jobid %s start %s", run.label, jobid, get_timestamp())
+    # define some environment vars for the user
+    os.environ["DETOUR_LABEL"] = run.label
+    os.environ["DETOUR_REMOTE"] = self.key
+    sp.check_call(";".join(["source .d2rc",
+                            " ".join(detour_rpc_argv("no_really_run", run))]),
+                  shell=True, executable="/bin/bash", cwd=str(Path(run.rundir, "tree")))
+
+  @remotely_only(interactive=True)
+  def no_really_run(self, run):
+    logger.warning("detour run label %s jobid %s start %s", run.label, run.props.jobid, get_timestamp())
     invocation = run.props.invocation
-    os.environ["DETOUR_LABEL"] = run.label # for the user program
     logger.warning("invoking %s", invocation)
     try:
-      status = sp.check_call(invocation, cwd=str(Path(run.rundir, "tree")))
+      status = sp.check_call(invocation)
     except:
       status = tb.format_exc()
       raise
@@ -598,7 +605,6 @@ class REMOTES:
     def kill(self, runs): raise NotImplementedError()
     def run(self, run):
       invocation = run.props.invocation
-      os.environ["DETOUR_LABEL"] = run.label # for the user program
       print(os.environ["PATH"])
       logger.warning("invoking %s", invocation)
       try:
@@ -615,16 +621,7 @@ class REMOTES:
       mkdirp(run.rundir)
       inner_command = ["script", "-e", "session_%s.script" % get_timestamp()]
       sp.check_call(["screen", "-d", "-m", "-S", run.screenlabel] + inner_command, cwd=str(run.rundir))
-      sp.check_call(["screen", "-S", run.screenlabel, "-p", "0", "-X", "stuff",
-                     f"conda deactivate; conda activate {run.props.condaenv}^M"],
-                    cwd=str(run.rundir))
-      sp.check_call(["screen", "-S", run.screenlabel, "-p", "0", "-X", "stuff",
-                     "which python^M"],
-                    cwd=str(run.rundir))
       # NOTE: && exit ensures screen terminates iff the command terminated successfully.
-      # FIXME somehow by the time we get to `run` the PATH is modified again with ~/bin and ~/.local/bin in front, so .bashrc must be sourced
-      # FIXME figure this out later -_________________________#___________________________-------------
-      # FIXME figured it out by putting ~/bin and friends only in .profile for now
       sp.check_call(["screen", "-S", run.screenlabel, "-p", "0", "-X", "stuff",
                     "%s && exit^M" % " ".join(detour_rpc_argv("run", run))],
                     cwd=str(run.rundir))
@@ -656,20 +653,16 @@ class REMOTES:
 
     def _submit_interactive_job(self, run):
       preset_flags = ["--%s=%s" % item for item in get_preset(run.props.preset, self.key).items()]
-      condacmd = f"conda activate {run.props.condaenv}"
       command = " ".join(detour_rpc_argv("run", run))
-      command = f"""XLA_FLAGS="--xla_gpu_cuda_data_dir=/ai/apps/x86_64/cuda/10.1" {command}"""
-      the_thing = ";".join(["module load cuda/10.1/cudnn/7.6", condacmd, command])
       sp.check_call(["srun", *preset_flags,
                      "--exclude=%s" % ",".join(self.excluded_hosts),
                      "--partition=unkillable",
                      "--pty",
                      # NOTE: used to have bash -lic, but this sets the crucial CUDA_VISIBLE_DEVICES variable to the empty string
-                     "bash", "-ic", the_thing])
+                     "bash", "-ic", command])
 
     def _submit_batch_job(self, run):
       mkdirp(run.rundir)
-      condacmd = f"conda activate {run.props.condaenv}"
       command = " ".join(detour_rpc_argv("run", run))
       sbatch_flags = dict(partition="high",
                           exclude=",".join(self.excluded_hosts),
@@ -680,14 +673,8 @@ class REMOTES:
       Path(run.rundir, "sbatch.sh").write_text(textwrap.dedent("""
         #!/bin/bash
         %s
-        #set -e
-        source ~/.bashrc
-        module load cuda/10.1/cudnn/7.6
-        export XLA_FLAGS="--xla_gpu_cuda_data_dir=/ai/apps/x86_64/cuda/10.1"
         %s
-        env | grep -i cuda
-        %s
-      """ % (sbatch_crud, condacmd, command)).strip())
+      """ % (sbatch_crud, command)).strip())
 
       output = sp.check_output(["sbatch", "sbatch.sh"], cwd=str(run.rundir))
       match = re.match(rb"\s*Submitted\s*batch\s*job\s*(?P<id>[0-9]+)\s*", output)
@@ -1402,4 +1389,3 @@ if not hasattr(Path, "write_text"):
 
 if __name__ == "__main__":
   CommandTreeTools.parse_and_call(main, sys.argv[1:])
-
