@@ -40,15 +40,18 @@ logger.setLevel(logging.INFO)
 
 # job dependencies are considered to be everything in the current directory, except
 # hidden files and __pycache__ and notebooks
+# NOTE .d2packager can now be used to manually stage the run directory
+# NOTE mar08: removed  "--exclude .*" because we want to include git if it was staged.
+# I suppose the purpose of filter now is to avoid pulling in big/cached stuff.
+# TODO maybe it is better to do this explicitly, giving jobs a path to a subdirectory
+# (e.g. ../artifacts, ../temp relative to rundir/tree) and syncing only artifacts back.
+# wouldn't want to sync back code changes anyway.
 rsync_filter = """
   --include .d2filter
   --include .d2rc
-  --exclude .*
   --exclude __pycache__
-  --exclude *.npz*-numpy.npy
-  --exclude *.ipynb
+  --exclude *.npy
   --exclude *.pdf
-  --exclude altair*.json
 """.strip().split() + ["--filter=: /.d2filter"]
 
 # globals
@@ -814,7 +817,11 @@ class Database(object):
     with tempfile.TemporaryDirectory() as tmpdir:
       tmp_rundir = Path(tmpdir, "rundir") # need a toplevel without random name so it won't affect digest
       mkdirp(tmp_rundir)
-      sp.check_call(["rsync", "-rlzF"] + rsync_filter + ["./", str(Path(tmp_rundir, "tree"))])
+
+      if Path("./.d2packager").exists():
+        sp.check_call(["./.d2packager", str(Path(tmp_rundir, "tree"))])
+      else:
+        sp.check_call(["rsync", "-rlzF"] + rsync_filter + ["./", str(Path(tmp_rundir, "tree"))])
 
       digest_output = sp.check_output(
         # (would prefer to use find -print0 and tar --null, but the latter doesn't seem to work)
