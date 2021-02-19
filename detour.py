@@ -157,7 +157,7 @@ class _:
       print(len(runs), "runs:", status)
       if verbose:
         for run in runs:
-          print("  ", run.labelview, run.props.hostname)
+          print("  ", run.labelview, "@", run.props.hostname)
   def recent(n=5):
     runs = G.db.get_runs()
     runs = sorted(runs, key=lambda run: run.rundir)
@@ -373,7 +373,7 @@ class BaseRemote:
 class Remote(BaseRemote):
   @locally_only()
   def bang(self, cmd):
-    return sp.call(self.ssh_wrapper + ["ssh", self.host, cmd])
+    return sp.call(self.ssh_wrapper + ["ssh", self.host, "bash", "-lic", cmd])
 
   @locally_only()
   def pull(self, runs):
@@ -386,7 +386,7 @@ class Remote(BaseRemote):
     if not runs: return
     rsync([run.rundir for run in runs],
           "%s:%s" % (self.host, self.database.runsdir),
-          ssh_wrapper=self.ssh_wrapper)
+          ssh_wrapper=self.ssh_wrapper, verbose=False)
 
   @locally_only()
   def purge(self, runs):
@@ -476,8 +476,15 @@ class Remote(BaseRemote):
     try:
       status = sp.check_call(invocation)
     except:
+      # TODO this trace really isn't very useful? altho maybe it is for SIGABRT and such
       status = tb.format_exc()
-      raise
+      # don't reraise if ipython --pdb job; the user already noticed the problem but
+      # there's no easy way to exit pdb with successful return value
+      # TODO only if interactive, but we don't know that here
+      if invocation[:2] == ["ipython", "--pdb"]:
+        pass
+      else:
+        raise
     finally:
       run.props.terminated = str(status)
 
@@ -547,16 +554,24 @@ class Remote(BaseRemote):
     for run in runs:
       self.push([run])
       self.enter_screen(run)
+      print("returning from", run.labelview)
 
   @remotely(interactive=True)
   def enter_screen(self, run):
     mkdirp(run.rundir)
     inner_command = ["script", "-e", "session_%s.script" % get_timestamp()]
     sp.check_call(["screen", "-d", "-m", "-S", run.screenlabel] + inner_command, cwd=str(run.rundir))
-    # NOTE: && exit ensures screen terminates iff the command terminated successfully.
-    sp.check_call(["screen", "-S", run.screenlabel, "-p", "0", "-X", "stuff",
-                   "%s && exit^M" % " ".join(detour_rpc_argv("submit_interactive_job", run))],
-                  cwd=str(run.rundir))
+    if False:
+      # NOTE: && exit ensures screen terminates iff the command terminated successfully.
+      sp.check_call(["screen", "-S", run.screenlabel, "-p", "0", "-X", "stuff",
+                    "%s && exit^M" % " ".join(detour_rpc_argv("submit_interactive_job", run))],
+                    cwd=str(run.rundir))
+    else:
+      # NOTE: actually exit regardless of status; it doesn't really help to be in screen on the login node
+      # and it complicates the user interaction by several levels.
+      sp.check_call(["screen", "-S", run.screenlabel, "-p", "0", "-X", "stuff",
+                     "%s; exit $!^M" % " ".join(detour_rpc_argv("submit_interactive_job", run))],
+                    cwd=str(run.rundir))
     sp.check_call(["screen", "-x", run.screenlabel],
                   env=dict(TERM="xterm-color"))
 
