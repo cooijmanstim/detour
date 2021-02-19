@@ -660,22 +660,12 @@ class REMOTES:
   class mila(Remote):
     key = "mila"
     host = "mila"
-    ssh_wrapper = "pshaw mila".split()
+    ssh_wrapper = "pssh mila.quebec/googlesuite".split()
+    #ssh_wrapper = "pshaw mila".split()
     runsdir = Path("/network/tmp1/cooijmat/detours")
 
     excluded_hosts = [
-      # TODO figure out if we need to exclude anything. mila00/01 don't exist anymore
-      #"mila00", # requires nvidia acknowledgement
-      #"mila01", # requires nvidia acknowledgement
-      #"leto21", # libdevice
-      #"leto23", # libdevice
-      #"leto31", # libdevice
-      #"leto32", # libdevice
-      #"leto11", # libdevice
-      #"bart14", # libdevice
-      "leto36", # cuda 10.1 too new for driver version 410.78
-      "power91", # crazy cpu machine
-      "power92", # crazy cpu machine
+      "kepler4", "kepler5", # no /home after cluster maintenance dec 2020
     ]
 
     def _submit_interactive_job(self, run):
