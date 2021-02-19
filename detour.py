@@ -1050,13 +1050,19 @@ def squeue(jobids, fields="jobid state reason timeused timeleft"):
 
 def get_preset(key, remote):
   key = key or "classic"
-  gpu_crud = dict(gres="gpu:titanx:1")#, constraint="x86_64&(12gb|16gb|24gb)")
+  #gpu_crud = dict(gres="gpu:titanx:1")#, constraint="x86_64&(12gb|16gb|24gb)")
+  gpu_crud = dict(gres="gpu:v100:1")#, constraint="x86_64&(12gb|16gb|24gb)")
   presets = dict(
     light=dict(time="1:00:00", mem="12G", **gpu_crud),
     classic=dict(time="23:59:59", mem="32G", **gpu_crud),
   )
+  presets["24h24gb"] = dict(time="23:59:59", mem="24G", **gpu_crud)
   presets["24h16gb"] = dict(time="23:59:59", mem="16G", **gpu_crud)
+  presets["8h24gb"] = dict(time="8:00:00", mem="24G", **gpu_crud)
+  presets["8h32gb"] = dict(time="8:00:00", mem="32G", **gpu_crud)
   presets["8h16gb"] = dict(time="8:00:00", mem="16G", **gpu_crud)
+  presets["16h16gb"] = dict(time="16:00:00", mem="16G", **gpu_crud)
+  presets["16h32gb"] = dict(time="16:00:00", mem="32G", **gpu_crud)
   presets["8h8gb"] = dict(time="8:00:00", mem="8G", **gpu_crud)
   presets["4h8gb"] = dict(time="4:00:00", mem="8G", **gpu_crud)
   preset = presets[key]
