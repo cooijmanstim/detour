@@ -112,6 +112,9 @@ class _:
   def autoalias(label, *, force=False):
     assert not G.config.on_remote
     print(G.db.autoalias(Run(label), force=force))
+  def alias(label, alias):
+    assert not G.config.on_remote
+    G.db.bind_alias(alias, Run(label))
 
   @FunctionTree
   def props():
@@ -201,6 +204,9 @@ class _:
   def bang(remote, cmd):
     remote = make_remote(remote)
     remote.bang(cmd)
+
+  def dump(*labels):
+    print(json.dumps([run.jsonably() for run in G.db.designated_runs(labels)]))
 
 def get_statuses(runs, ignore_cache=False):
   assert not G.config.on_remote
@@ -315,6 +321,7 @@ class RemoteCommand:
 
   def get_ssh_incantation(self, remote, method, argv, kwargs, **flags):
     rpc_argv = detour_rpc_argv(method, *argv, rpc_kwargs=kwargs, **flags)
+    rpc_argv = [f"DETOUR_REMOTE={remote.key}", *rpc_argv]
     if True:
       # hoop-jumpery to get a motherfucking login shell. let's see how many levels of wrapping and mangling we need
       thing = " ".join(rpc_argv)
@@ -455,6 +462,8 @@ class Remote(BaseRemote):
     # define some environment vars for the user
     os.environ["DETOUR_LABEL"] = run.label
     os.environ["DETOUR_REMOTE"] = self.key
+    if run.props.study is not None:
+      os.environ["DETOUR_STUDY"] = run.props.study
     sp.check_call(";".join(["source .d2rc",
                             " ".join(detour_rpc_argv("no_really_run", run))]),
                   shell=True, executable="/bin/bash", cwd=str(Path(run.rundir, "tree")))
@@ -722,10 +731,12 @@ class REMOTES:
       """ % (sbatch_crud, command)).strip())
 
       output = sp.check_output(["sbatch", "sbatch.sh"], cwd=str(run.rundir))
-      match = re.match(rb"\s*Submitted\s*batch\s*job\s*(?P<id>[0-9]+)\s*", output)
+      # NOTE sometimes output is preceded by some lines about kerberos ticket renewal
+      match = re.search(rb"\s*Submitted\s*batch\s*job\s*(?P<id>[0-9]+)\s*$", output)
       if not match:
         print(output)
         import pdb; pdb.set_trace()
+        # failed to parse output of sbatch
       jobid = match.group("id").decode("ascii")
       run.props.jobid = jobid
       return jobid
@@ -740,6 +751,11 @@ class Run(namedtuple("Run", "label")):
   def props(self):
     assert self.rundir.exists()
     return Props(Path(self.rundir, "props"))
+
+  def jsonably(self):
+    return dict(iter(self.props),
+                label=self.label,
+                rundir=str(self.rundir))
 
   def get_output_path(self):
     for pattern in "session*.script slurm-*.out".split():
@@ -774,7 +790,7 @@ class Run(namedtuple("Run", "label")):
     def _from_output():
       output = self.get_output()
       errors = extract_errors(output)
-      errors = [abridge(error, 80) for error in errors]
+      errors = [terminal_sanitize(abridge(error, 80)) for error in errors]
       return "; ".join(errors)
 
     status = self.props.terminated
@@ -1207,6 +1223,11 @@ def abridge(s, maxlen=80):
   k = (maxlen - 3) // 2
   return s[:k] + "..." + s[len(s) - k:]
 
+def terminal_sanitize(s):
+  # https://stackoverflow.com/a/19016117/7601527
+  import unicodedata
+  return "".join(c for c in s if unicodedata.category(c)[0] != "C")
+
 def groupby(iterable, key):
   groups = ddict(list)
   for item in iterable:
@@ -1338,11 +1359,12 @@ class NestedArgumentParser(argparse.ArgumentParser):
   def factory(cls, *args, **kwargs):
     return ft.partial(cls, *args, **kwargs)
 
-def rsync(sources, destination, ssh_wrapper=()):
+def rsync(sources, destination, ssh_wrapper=(), verbose=True):
+  v = "v" if verbose else ""
   for subset in segments(sources, 100):
     for i in range(5):
       try:
-        sp.check_call(list(ssh_wrapper) + ["rsync", "-urltvz", "--ignore-missing-args"] +
+        sp.check_call(list(ssh_wrapper) + ["rsync", f"-urlt{v}z", "--ignore-missing-args"] +
                       rsync_filter + subset + [destination])
       except sp.CalledProcessError as e:
         if e.returncode == 23:
