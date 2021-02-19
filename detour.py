@@ -1012,11 +1012,13 @@ def extract_exceptions(output):
   exceptions = filter(fn, exceptions)
   return exceptions
 
-def squeue(jobids, fields="state reason timeused timeleft"):
+def squeue(jobids, fields="jobid state reason timeused timeleft"):
   fields = wordlist(fields)
+  if "jobid" not in fields:
+    fields = ["jobid", *fields]
   try:
     blob = sp.check_output(["squeue",
-                            "-O", ",".join(["jobid"] + fields),
+                            "-O", ",".join(fields),
                             "-j", ",".join(jobids)],
                            stderr=sp.STDOUT)
     error = 0
@@ -1025,11 +1027,16 @@ def squeue(jobids, fields="state reason timeused timeleft"):
     # 11922138            PENDING             Priority            0:00                1-00:00:00
     # 11922147            PENDING             Priority            0:00                1-00:00:00
     # 11922157            PENDING             Priority            0:00                1-00:00:00
-    for line in blob.splitlines()[1:]:
-      line = line.decode("utf-8")
-      # FIXME the "reason" field may have whitespace
-      jobid, *values = line.split()
-      yield jobid, dict(eqzip(fields, values))
+    lines = blob.decode("utf-8").splitlines()
+    header = lines[0]
+    # can't simply split rows on whitespace because REASON may have spaces. instead
+    # user column header locations as fenceposts.
+    fenceposts = [header.index(column) for column in header.split()] + [None]
+    for line in lines[1:]:
+      line = line
+      values = {field: line[fenceposts[i]:fenceposts[i+1]].strip()
+                for i, field in enumerate(fields)}
+      yield values["jobid"], values
   except sp.CalledProcessError as e:
     blob = e.output
     error = e.returncode
