@@ -146,18 +146,21 @@ class _:
       sys.exit(1)
     sp.check_call(["less", "+G", path])
 
-  def status(*labels, verbose=False, refresh=False):
+  def status(*labels, verbose=False, refresh=False, fullstatus=False):
     runs = G.db.designated_runs(labels)
     statuses = get_statuses(runs, ignore_cache=refresh)
     def criterion(run):
       status = statuses[run]
-      if isinstance(status, dict): return status["state"]
-      else:                        return status
+      if isinstance(status, dict):
+        status = status["state"]
+      return abridge(status, 64)
     for status, runs in groupby(runs, criterion).items():
       print(len(runs), "runs:", status)
       if verbose:
         for run in runs:
           print("  ", run.labelview, "@", run.props.hostname)
+          if fullstatus:
+            print("    ", statuses[run])
   def recent(n=5):
     runs = G.db.get_runs()
     runs = sorted(runs, key=lambda run: run.rundir)
@@ -795,7 +798,7 @@ class Run(namedtuple("Run", "label")):
     def _from_output():
       output = self.get_output()
       errors = extract_errors(output)
-      errors = [terminal_sanitize(abridge(error, 80)) for error in errors]
+      errors = [terminal_sanitize(abridge(error, 72)) for error in errors]
       return "; ".join(errors)
 
     status = self.props.terminated
@@ -873,6 +876,8 @@ class Database(object):
   def designated_labels(self, labels, ignore_nonexistent=False, deduplicate=True):
     result = []
     for label in labels:
+      if label.startswith("-"):
+        logger.warning("expected label designator but got what looks like a flag: %s", label)
       path = Path(self.runsdir, label)
       if path.is_symlink(): # an alias
         run = self.resolve_alias(path.name)
