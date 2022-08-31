@@ -660,7 +660,7 @@ class REMOTES:
     def attach(self, run):
       sp.check_call(["screen", "-x", run.screenlabel])
 
-  class mila(Remote):
+  class mila(Remote): # NOTE don't use past 2021-10-29; now using /network/scratch in remote mila2022
     key = "mila"
     host = "mila"
     ssh_wrapper = "pssh mila.quebec/googlesuite".split()
@@ -668,7 +668,6 @@ class REMOTES:
     runsdir = Path("/network/tmp1/cooijmat/detours")
 
     excluded_hosts = [
-      "kepler4", "kepler5", # no /home after cluster maintenance dec 2020
     ]
 
     def _submit_interactive_job(self, run):
@@ -705,7 +704,51 @@ class REMOTES:
       run.props.jobid = jobid
       return jobid
 
-  class cedar(Remote):
+  class mila2022(Remote):
+    key = "mila2022"
+    host = "mila"
+    #ssh_wrapper = "pssh mila.quebec/googlesuite".split()
+    ssh_wrapper = []
+    runsdir = Path("/network/scratch/c/cooijmat/detours")
+
+    excluded_hosts = [
+    ]
+
+    def _submit_interactive_job(self, run):
+      preset_flags = ["--%s=%s" % item for item in get_preset(run.props.preset, self.key).items()]
+      command = " ".join(detour_rpc_argv("run", run))
+      sp.check_call(["srun", *preset_flags,
+                     "--exclude=%s" % ",".join(self.excluded_hosts),
+                     "--partition=unkillable",
+                     "--pty",
+                     # NOTE: used to have bash -lic, but this sets the crucial CUDA_VISIBLE_DEVICES variable to the empty string
+                     "bash", "-ic", command])
+
+    def _submit_batch_job(self, run):
+      mkdirp(run.rundir)
+      command = " ".join(detour_rpc_argv("run", run))
+      sbatch_flags = dict(partition="high",
+                          exclude=",".join(self.excluded_hosts),
+                          **get_preset(run.props.preset, self.key))
+      sbatch_crud = "\n".join("#SBATCH --%s=%s" % item for item in sbatch_flags.items())
+
+      # TODO run in $SLURMTMP if it ever matters
+      Path(run.rundir, "sbatch.sh").write_text(textwrap.dedent("""
+        #!/bin/bash
+        %s
+        %s
+      """ % (sbatch_crud, command)).strip())
+
+      output = sp.check_output(["sbatch", "sbatch.sh"], cwd=str(run.rundir))
+      match = re.match(rb"\s*Submitted\s*batch\s*job\s*(?P<id>[0-9]+)\s*", output)
+      if not match:
+        print(output)
+        import pdb; pdb.set_trace()
+      jobid = match.group("id").decode("ascii")
+      run.props.jobid = jobid
+      return jobid
+
+  class cedar(Remote):  # NOTE unused for years
     key = "cedar"
     ssh_wrapper = "pshaw cedar".split()
     host = "cedar"
