@@ -144,7 +144,7 @@ class _:
     if not path:
       logger.warning("no output found for %s", run.labelview)
       sys.exit(1)
-    sp.check_call(["less", "+G", path])
+    sp.check_call(["less", "+G", "-R", path])
 
   def status(*labels, verbose=False, refresh=False, fullstatus=False):
     runs = G.db.designated_runs(labels)
@@ -156,7 +156,7 @@ class _:
       return abridge(status, 64)
     for status, runs in groupby(runs, criterion).items():
       print(len(runs), "runs:", status)
-      if verbose:
+      if True or verbose: # seems good always
         for run in runs:
           print("  ", run.labelview, "@", run.props.hostname)
           if fullstatus:
@@ -987,11 +987,15 @@ class Database(object):
 
 def extract_errors(output):
   errors = []
-  if "error:" in output:
-    # look for low-level errors (slurmstepd, linking, ...)
-    for line in output.splitlines():
-      if "error:" in line:
-        errors.append(line)
+  # look for low-level errors (slurmstepd, linking, ...)
+  for line in output.splitlines():
+    if "Resource exhausted: Out of memory while trying to allocate" in line:
+      return ["gpu out of memory"]
+    if "DUE TO TIME LIMIT" in line:
+      return ["out of time"]
+
+    if "error:" in line:
+      errors.append(line)
   # also include any exceptions we find
   exceptions = extract_exceptions(output)
   errors.extend(exceptions)
@@ -1067,9 +1071,12 @@ def get_preset(key, remote):
   presets["8h32gb"] = dict(time="8:00:00", mem="32G", **gpu_crud)
   presets["8h16gb"] = dict(time="8:00:00", mem="16G", **gpu_crud)
   presets["16h16gb"] = dict(time="16:00:00", mem="16G", **gpu_crud)
+  presets["16h24gb"] = dict(time="16:00:00", mem="24G", **gpu_crud)
   presets["16h32gb"] = dict(time="16:00:00", mem="32G", **gpu_crud)
   presets["8h8gb"] = dict(time="8:00:00", mem="8G", **gpu_crud)
   presets["4h8gb"] = dict(time="4:00:00", mem="8G", **gpu_crud)
+  # k80 are 12gb
+  presets["8h16gb_k80"] = dict(time="8:00:00", mem="16G", gres="gpu:k80:1")
   preset = presets[key]
   return preset
 
