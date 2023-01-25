@@ -122,7 +122,11 @@ class _:
   def dequeue():
     assert G.config.on_remote
     queue = G.db.runsdir / "queue"
-    head, *tail = queue.read_text().split()
+    labels = queue.read_text().split()
+    if not labels:
+      print("queue is empty")
+      return
+    head, *tail = labels
     queue.write_text("\n".join(tail))
     run = G.db.designated_run(head)
     G.remote.run(run)
