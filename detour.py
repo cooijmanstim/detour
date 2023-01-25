@@ -147,7 +147,7 @@ class _:
     def get(label, *keys):
       run = G.db.designated_run(label)
       for key, value in run.props: # TODO pprint as dict?
-        print(key, value)
+        print(key, ":", value)
     def set(label, key, value):
       run = G.db.designated_run(label)
       run.props[key] = value
@@ -963,6 +963,11 @@ class Database(object):
       elif path.exists(): # assume rundir, which has label as its name
         assert path.is_dir()
         result.append(label)
+      elif len(label) == 4 and label.isalnum():  # perhaps it is the hash portion of a run's label
+        for run in self.get_runs():
+          if run.rundir.exists() and run.label.endswith(label):
+            result.append(run.label)
+        # TODO if it didn't match any, fall through
       else: # assume it's a study
         # TODO think about whether we can store studies as nested runsdirs
         study_labels = self.study_labels(label)
