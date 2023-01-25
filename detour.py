@@ -59,6 +59,7 @@ G = attrdict(config=attrdict(), db=None)
 
 @FunctionTree
 def main(*, on_remote=None):
+  on_remote = os.environ.get("DETOUR_REMOTE", None)
   try:
     G.config.update(on_remote=on_remote)
     G.remote = make_remote(on_remote)
@@ -109,6 +110,24 @@ class _:
     run.props.remote = remote
     run.props.preset = preset
     print(run.label)
+
+  # alternate flow: package, push, put onto a queue, then later dequeue and run
+  def enqueuecmd(*invocation, remote=None):
+    assert not G.config.on_remote
+    run = G.db.package(invocation)
+    run.props.remote = remote
+    run.remote.push([run])
+    run.remote.enqueue([run])
+    print(run.label)
+  def dequeue():
+    assert G.config.on_remote
+    queue = G.db.runsdir / "queue"
+    head, *tail = queue.read_text().split()
+    queue.write_text("\n".join(tail))
+    run = G.db.designated_run(head)
+    G.remote.run(run)
+    print("finished", run.labelview)
+
   def autoalias(label, *, force=False):
     assert not G.config.on_remote
     print(G.db.autoalias(Run(label), force=force))
@@ -390,6 +409,13 @@ class Remote(BaseRemote):
     rsync([run.rundir for run in runs],
           "%s:%s" % (self.host, self.database.runsdir),
           ssh_wrapper=self.ssh_wrapper, verbose=False)
+
+  @locally_only()
+  def enqueue(self, runs):
+    if not runs: return
+    labels = "\n".join([run.label for run in runs])
+    queue = self.database.runsdir / "queue"
+    sp.check_call(self.ssh_wrapper + ["ssh", self.host, "bash", "-c", f"'echo {labels} >> {queue}'"])
 
   @locally_only()
   def purge(self, runs):
@@ -797,6 +823,7 @@ class Run(namedtuple("Run", "label")):
   remote = property(lambda self: make_remote(self.props.remote))
   screenlabel = property(lambda self: f"detour_{self.label}")
   labelview = property(lambda self: G.db.present_label(self))
+  remote_rundir = property(lambda self: self.remote.runsdir / self.label)
 
   @property
   def props(self):
@@ -1491,3 +1518,4 @@ if not hasattr(Path, "write_text"):
 
 if __name__ == "__main__":
   CommandTreeTools.parse_and_call(main, sys.argv[1:])
+
