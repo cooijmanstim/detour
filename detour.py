@@ -425,7 +425,7 @@ class Remote(BaseRemote):
       for subset in segments(runs, 100): # to break up long argument list (e.g. large study)
         sp.check_call(self.ssh_wrapper + ["ssh", self.host] +
                       # -f because we don't care if any don't exist
-                      ["rm", "-rf"] + [str(run.rundir) for run in subset])
+                      ["rm", "-rf"] + [str(run.remote_rundir) for run in subset])
         sp.check_call(["rm", "-rf"] + [str(run.rundir) for run in subset])
     finally:
       for alias in aliases:
@@ -493,6 +493,7 @@ class Remote(BaseRemote):
     os.environ["DETOUR_REMOTE"] = self.key
     if run.props.study is not None:
       os.environ["DETOUR_STUDY"] = run.props.study
+    # now make a shell, run source .d2rc to set it up, then really really run the job
     sp.check_call(";".join(["source .d2rc",
                             " ".join(detour_rpc_argv("no_really_run", run))]),
                   shell=True, executable="/bin/bash", cwd=str(Path(run.rundir, "tree")))
