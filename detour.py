@@ -59,7 +59,7 @@ G = attrdict(config=attrdict(), db=None)
 
 @FunctionTree
 def main(*, on_remote=None):
-  on_remote = os.environ.get("DETOUR_REMOTE", None)
+  on_remote = os.environ.get("D2_REMOTE", on_remote)
   try:
     G.config.update(on_remote=on_remote)
     G.remote = make_remote(on_remote)
@@ -131,6 +131,10 @@ class _:
     run = G.db.designated_run(head)
     G.remote.run(run)
     print("finished", run.labelview)
+  def remoterun(label):  # can call this e.g. to re-run a dequeue'd job that failed
+    assert G.config.on_remote
+    run = G.db.designated_run(label)
+    G.remote.run(run)
 
   def autoalias(label, *, force=False):
     assert not G.config.on_remote
@@ -347,14 +351,15 @@ class RemoteCommand:
 
   def get_ssh_incantation(self, remote, method, argv, kwargs, **flags):
     rpc_argv = detour_rpc_argv(method, *argv, rpc_kwargs=kwargs, **flags)
-    rpc_argv = [f"DETOUR_REMOTE={remote.key}", *rpc_argv]
-    if True:
-      # hoop-jumpery to get a motherfucking login shell. let's see how many levels of wrapping and mangling we need
-      thing = " ".join(rpc_argv)
-      assert "'" not in thing
-      return remote.ssh_wrapper + ["ssh", "-t", remote.host, "bash -l -c '%s'" % thing]
-    else:
-      return remote.ssh_wrapper + ["ssh", "-t", remote.host] + rpc_argv
+    rpc_argv = [f"D2_REMOTE={remote.key}", *rpc_argv]
+    # TODO generalize this. env variables are a nice way to forward this kind of info?
+    if "D2_PARTITION" in os.environ:
+      rpc_argv = [f"D2_PARTITION={os.environ['D2_PARTITION']}", *rpc_argv]
+    # we lost. we need bash -l to get a login shell, and then we need to join the argv
+    # into a single argument to bash.
+    thing = " ".join(rpc_argv)
+    assert "'" not in thing
+    return remote.ssh_wrapper + ["ssh", "-X", "-t", remote.host, "bash -lc '%s'" % thing]
 
 # decorator to define a two-stage command
 @decorator_with_args
@@ -464,7 +469,7 @@ class Remote(BaseRemote):
         # this could happen if the job has terminated, in which case the local part should
         # pull it out of the `terminated` file. however due to race conditions (the job
         # terminated in the time it took for control to arrive here) we'll take care of it.
-        statuses[run] = run.get_status()
+        statuses[run] = run.get_status(missing_from_queue=True)
 
     assert set(runs) == set(statuses.keys())
     return statuses
@@ -493,10 +498,11 @@ class Remote(BaseRemote):
     jobid = os.environ["SLURM_JOB_ID"]
     run.props.jobid = jobid
     # define some environment vars for the user
-    os.environ["DETOUR_LABEL"] = run.label
-    os.environ["DETOUR_REMOTE"] = self.key
+    os.environ["D2_LABEL"] = run.label
+    os.environ["D2_RUNSDIR"] = str(self.runsdir)
+    os.environ["D2_REMOTE"] = self.key
     if run.props.study is not None:
-      os.environ["DETOUR_STUDY"] = run.props.study
+      os.environ["D2_STUDY"] = run.props.study
     # now make a shell, run source .d2rc to set it up, then really really run the job
     sp.check_call(";".join(["source .d2rc",
                             " ".join(detour_rpc_argv("no_really_run", run))]),
@@ -702,11 +708,12 @@ class REMOTES:
     ]
 
     def _submit_interactive_job(self, run):
-      preset_flags = ["--%s=%s" % item for item in get_preset(run.props.preset, self.key).items()]
+      preset_flags = ["--%s=%s" % item for item in
+                      get_preset(run.props.preset, self.key,
+                                 defaults=dict(partition="unkillable")).items()]
       command = " ".join(detour_rpc_argv("run", run))
       sp.check_call(["srun", *preset_flags,
                      "--exclude=%s" % ",".join(self.excluded_hosts),
-                     "--partition=unkillable",
                      "--pty",
                      # NOTE: used to have bash -lic, but this sets the crucial CUDA_VISIBLE_DEVICES variable to the empty string
                      "bash", "-ic", command])
@@ -714,9 +721,9 @@ class REMOTES:
     def _submit_batch_job(self, run):
       mkdirp(run.rundir)
       command = " ".join(detour_rpc_argv("run", run))
-      sbatch_flags = dict(partition="high",
-                          exclude=",".join(self.excluded_hosts),
-                          **get_preset(run.props.preset, self.key))
+      sbatch_flags = dict(exclude=",".join(self.excluded_hosts),
+                          **get_preset(run.props.preset, self.key, defaults=dict(partition="high")),
+                          **{"job-name": run.label})
       sbatch_crud = "\n".join("#SBATCH --%s=%s" % item for item in sbatch_flags.items())
 
       # TODO run in $SLURMTMP if it ever matters
@@ -746,11 +753,12 @@ class REMOTES:
     ]
 
     def _submit_interactive_job(self, run):
-      preset_flags = ["--%s=%s" % item for item in get_preset(run.props.preset, self.key).items()]
+      preset_flags = ["--%s=%s" % item for item in
+                      get_preset(run.props.preset, self.key,
+                                 defaults=dict(partition="unkillable")).items()]
       command = " ".join(detour_rpc_argv("run", run))
       sp.check_call(["srun", *preset_flags,
                      "--exclude=%s" % ",".join(self.excluded_hosts),
-                     "--partition=unkillable",
                      "--pty",
                      # NOTE: used to have bash -lic, but this sets the crucial CUDA_VISIBLE_DEVICES variable to the empty string
                      "bash", "-ic", command])
@@ -758,9 +766,9 @@ class REMOTES:
     def _submit_batch_job(self, run):
       mkdirp(run.rundir)
       command = " ".join(detour_rpc_argv("run", run))
-      sbatch_flags = dict(partition="high",
-                          exclude=",".join(self.excluded_hosts),
-                          **get_preset(run.props.preset, self.key))
+      sbatch_flags = dict(exclude=",".join(self.excluded_hosts),
+                          **get_preset(run.props.preset, self.key),
+                          **{"job-name": run.label})
       sbatch_crud = "\n".join("#SBATCH --%s=%s" % item for item in sbatch_flags.items())
 
       # TODO run in $SLURMTMP if it ever matters
@@ -869,7 +877,7 @@ class Run(namedtuple("Run", "label")):
     del self.props.terminated
     # we can probably leave the output files of past runs?
 
-  def get_status(self):
+  def get_status(self, missing_from_queue=False):
     def _from_output():
       output = self.get_output()
       errors = extract_errors(output)
@@ -886,10 +894,12 @@ class Run(namedtuple("Run", "label")):
       # check the output for slurm errors. e.g.:
       # slurmstepd: error: *** JOB 11943965 ON cdr248 CANCELLED AT 2018-09-18T09:30:03 DUE TO TIME LIMIT ***
       status = _from_output()
-      # not marked as terminated; either the job has not terminated, or
-      # it was terminated abruptly, e.g. by SIGKILL from slurm
       if not status:
-        status = "unterminated"
+        # not marked as terminated; either the job has not terminated, or
+        # it was terminated abruptly, e.g. by SIGKILL from slurm
+        # NOTE sometimes a job gets (re)submitted and we have a jobid, but
+        # it never ends up in the queue, and then we get here.
+        status = "lost" if missing_from_queue else "unterminated"
     return status
 
 
@@ -964,10 +974,16 @@ class Database(object):
         assert path.is_dir()
         result.append(label)
       elif len(label) == 4 and label.isalnum():  # perhaps it is the hash portion of a run's label
-        for run in self.get_runs():
-          if run.rundir.exists() and run.label.endswith(label):
-            result.append(run.label)
+        matches = []
+        for rundir in self.runsdir.glob(f"????????_??????_{label}"):
+          matches.append(Run(rundir.name))
+        if len(matches) > 1:
+          print(f"multiple runs with hash {label}:")
+          for run in matches:
+            print(run.labelview)
+          sys.exit(1)
         # TODO if it didn't match any, fall through
+        result.extend([run.label for run in matches])
       else: # assume it's a study
         # TODO think about whether we can store studies as nested runsdirs
         study_labels = self.study_labels(label)
@@ -982,11 +998,11 @@ class Database(object):
   def designated_run(self, label):
     runs = self.designated_runs([label])
     if not runs:
-      print(self.runsdir)
-      raise KeyError("unknown run", label)
+      print("could not find run", label, "in", self.runsdir)
+      sys.exit(1)
     if len(runs) > 1:
       # this won't happen unless `label` is the name of a study
-      raise ValueError("multiple runs associated with", label)
+      print("expected a single run, but found multiple runs associated with", label)
     return runs[0]
 
   def present_label(self, run):
@@ -1137,7 +1153,8 @@ def squeue(jobids, fields="jobid state reason timeused timeleft"):
       logging.error("something went wrong in call to squeue, dropping into pdb")
       import pdb; pdb.set_trace()
 
-def get_preset(key, remote):
+def get_preset(key, remote, defaults=()):
+  defaults = dict(defaults)
   key = key or "classic"
   #gpu_crud = dict(gres="gpu:titanx:1")#, constraint="x86_64&(12gb|16gb|24gb)")
   gpu_crud = dict(gres="gpu:v100:1")#, constraint="x86_64&(12gb|16gb|24gb)")
@@ -1145,6 +1162,7 @@ def get_preset(key, remote):
     light=dict(time="1:00:00", mem="12G", **gpu_crud),
     classic=dict(time="23:59:59", mem="32G", **gpu_crud),
   )
+  presets["32h24gb"] = dict(time="32:00:00", mem="24G", **gpu_crud)
   presets["24h24gb"] = dict(time="23:59:59", mem="24G", **gpu_crud)
   presets["24h16gb"] = dict(time="23:59:59", mem="16G", **gpu_crud)
   presets["8h24gb"] = dict(time="8:00:00", mem="24G", **gpu_crud)
@@ -1157,9 +1175,13 @@ def get_preset(key, remote):
   presets["4h8gb"] = dict(time="4:00:00", mem="8G", **gpu_crud)
   # k80 are 12gb
   presets["8h16gb_k80"] = dict(time="8:00:00", mem="16G", gres="gpu:k80:1")
+  presets["16h16gb_2gpu"] = dict(time="16:00:00", mem="16G", gres="gpu:2")#, partition="main")
   preset = presets[key]
-  return preset
 
+  if "D2_PARTITION" in os.environ:
+    preset["partition"] = os.environ["D2_PARTITION"]
+
+  return {**dict(defaults), "cpus-per-gpu":"4", **preset}
 
 class RPCCodec:
   @ft.singledispatch
