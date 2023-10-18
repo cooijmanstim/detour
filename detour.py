@@ -613,7 +613,7 @@ class Remote(BaseRemote):
                      "%s; exit $!^M" % " ".join(detour_rpc_argv("submit_interactive_job", run))],
                     cwd=str(run.rundir))
     sp.check_call(["screen", "-x", run.screenlabel],
-                  env=dict(TERM="xterm-color"))
+                  env={**os.environ, "TERM": "xterm-color"})
 
   @enter_screen.locally
   def enter_screen(self, run, call_remote=None):
