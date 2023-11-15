@@ -443,7 +443,7 @@ class Remote(BaseRemote):
 
   @remotely(interactive=True)
   def visit(self, run):
-    sp.check_call("bash", cwd=str(run.rundir))
+    sp.call("bash", cwd=str(run.rundir))
 
   @remotely(interactive=False)
   def status(self, runs):
@@ -709,8 +709,7 @@ class REMOTES:
 
     def _submit_interactive_job(self, run):
       preset_flags = ["--%s=%s" % item for item in
-                      get_preset(run.props.preset, self.key,
-                                 defaults=dict(partition="unkillable")).items()]
+                      get_preset(run.props.preset, self.key).items()]
       command = " ".join(detour_rpc_argv("run", run))
       sp.check_call(["srun", *preset_flags,
                      "--exclude=%s" % ",".join(self.excluded_hosts),
@@ -754,8 +753,7 @@ class REMOTES:
 
     def _submit_interactive_job(self, run):
       preset_flags = ["--%s=%s" % item for item in
-                      get_preset(run.props.preset, self.key,
-                                 defaults=dict(partition="unkillable")).items()]
+                      get_preset(run.props.preset, self.key).items()]
       command = " ".join(detour_rpc_argv("run", run))
       sp.check_call(["srun", *preset_flags,
                      "--exclude=%s" % ",".join(self.excluded_hosts),
