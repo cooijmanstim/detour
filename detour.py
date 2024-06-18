@@ -249,7 +249,9 @@ def get_statuses(runs, ignore_cache=False):
     else:
       remote.pull([run for run in runs if not run.known_terminated])
     # for unterminated, figure out statuses remotely
-    statuses.update(remote.status([run for run in runs if not run.known_terminated]))
+    unterminated = [run for run in runs if not run.known_terminated]
+    if unterminated:
+      statuses.update(remote.status(unterminated))
     # for terminated, figure out statuses locally
     terminated = [run for run in runs if run.known_terminated]
     statuses.update((run, run.get_status()) for run in terminated)
@@ -936,6 +938,13 @@ class Database(object):
         shell=True, cwd=tmpdir)
       # with timestamp, 4 characters (32 bits) should be plenty
       digest = digest_output.decode().splitlines()[0].split()[0][:4]
+      if digest.isnumeric():
+        # fully numeric digests cause all kinds of issues
+        # (apparently 20240101_123456_7890 is considered a valid
+        #  numeric literal in modern languages -____________-)
+        # avoid numeric digests while keeping the same format?
+        # just modify the digest...
+        digest = f"a{digest[1:]}"
 
       timestamp = get_timestamp()
       label = "%s_%s" % (timestamp, digest)
